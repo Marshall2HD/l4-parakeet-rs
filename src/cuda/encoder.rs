@@ -134,6 +134,7 @@ pub fn benchmark_encoder_layer(
         pack_scores: encoder_module.load_function("pk_sm89_pack_score_vectors")?,
         pack_key: encoder_module.load_function("pk_sm89_pack_key_int4")?,
         attention_output_fp8: encoder_module.load_function("pk_sm89_attention_output_fp8")?,
+        qkv_fp8: encoder_module.load_function("pk_sm89_qkv_fp8")?,
         linear: linear_module.load_function("pk_sm89_fp16_linear_epilogue")?,
         linear_large: linear_module.load_function("pk_sm89_fp16_linear_epilogue_m64")?,
         qkv: linear_module.load_function("pk_sm89_fp16_qkv")?,
@@ -317,6 +318,7 @@ pub(super) struct EncoderKernels {
     pub(super) pack_scores: CudaFunction,
     pub(super) pack_key: CudaFunction,
     pub(super) attention_output_fp8: CudaFunction,
+    pub(super) qkv_fp8: CudaFunction,
     pub(super) linear: CudaFunction,
     pub(super) linear_large: CudaFunction,
     pub(super) qkv: CudaFunction,
@@ -731,18 +733,32 @@ fn run_layer(
         )?;
     }
 
-    launch_norm(
-        stream,
-        &kernels.layer_norm,
-        &buffers.state_a,
-        &weights.norm_attention_weight,
-        &weights.norm_attention_bias,
-        &mut buffers.normalized,
-        rows,
-        padded_rows,
-    )?;
     let row_values = padded_rows * MODEL_WIDTH;
-    if use_large_linear {
+    // The fused FP8 projection needs the per-request weight arena to fit
+    // in the workspace alongside query, key and row scales.
+    let use_fused_qkv = padded_rows >= 1040
+        && 3 * padded_rows * MODEL_WIDTH
+            + padded_rows * size_of::<f32>() / size_of::<f16>()
+            + 3 * MODEL_WIDTH * MODEL_WIDTH / size_of::<f16>()
+            + 3 * MODEL_WIDTH * size_of::<f32>() / size_of::<f16>()
+            <= padded_rows * FF_WIDTH;
+    if use_fused_qkv {
+        launch_qkv_fp8(stream, kernels, weights, buffers, rows, padded_rows)?;
+    } else {
+        launch_norm(
+            stream,
+            &kernels.layer_norm,
+            &buffers.state_a,
+            &weights.norm_attention_weight,
+            &weights.norm_attention_bias,
+            &mut buffers.normalized,
+            rows,
+            padded_rows,
+        )?;
+    }
+    if use_fused_qkv {
+        // Query, packed key and transposed value are already in place.
+    } else if use_large_linear {
         for (index, weight) in [&weights.query, &weights.key].into_iter().enumerate() {
             let input = buffers.normalized.slice(..);
             let mut output = buffers
@@ -856,6 +872,16 @@ fn run_layer(
         } else {
             &kernels.attention
         };
+        // The fused projection left the packed key vectors and scales in the
+        // key arena; the dead FP16 key is never materialized on that path.
+        let prepacked_key = if use_fused_qkv {
+            Some(unsafe {
+                key.transmute::<u8>(qkv_key_arena_bytes(padded_rows))
+                    .ok_or("packed key arena exceeds key buffer")?
+            })
+        } else {
+            None
+        };
         launch_attention_arena(
             stream,
             attention_kernel,
@@ -866,6 +892,7 @@ fn run_layer(
             &key.slice(..),
             &value.slice(..),
             value_fp8.as_mut().map(|values| values.slice(..)).as_ref(),
+            prepacked_key.as_ref(),
             &position,
             &weights.bias_u,
             &weights.bias_v,
@@ -1835,6 +1862,121 @@ fn launch_qkv_arena(
     Ok(())
 }
 
+/// Packed key vectors (64 bytes per row and head) followed by their scales.
+fn qkv_key_arena_bytes(padded_rows: usize) -> usize {
+    padded_rows * MODEL_WIDTH + padded_rows * 8 * size_of::<f32>()
+}
+
+/// One FP8 launch for the query, key and value projections of packed shapes.
+///
+/// The normalization kernel is the retained exact FP16-rounded LayerNorm with
+/// dynamic E4M3 row quantization. Weight packing stays inside the request in
+/// the dead FP16 value slot of the workspace, so no persistent bytes change.
+fn launch_qkv_fp8(
+    stream: &Arc<CudaStream>,
+    kernels: &EncoderKernels,
+    layer: &LayerWeights<'_>,
+    buffers: &mut LayerBuffers,
+    rows: usize,
+    padded_rows: usize,
+) -> Result<(), Box<dyn Error>> {
+    let row_values = padded_rows * MODEL_WIDTH;
+    let mut activations = unsafe {
+        buffers
+            .normalized
+            .transmute_mut::<u8>(row_values)
+            .ok_or("FP8 attention input exceeds normalized buffer")?
+    };
+    let (mut query, mut remaining) = buffers.workspace.split_at_mut(row_values);
+    let (mut key_arena, mut remaining) = remaining.split_at_mut(row_values);
+    let (mut row_scale_arena, mut remaining) =
+        remaining.split_at_mut(padded_rows * size_of::<f32>() / size_of::<f16>());
+    let (mut weight_arena, mut scale_arena) =
+        remaining.split_at_mut(3 * MODEL_WIDTH * MODEL_WIDTH / size_of::<f16>());
+    let mut row_scales = unsafe {
+        row_scale_arena
+            .transmute_mut::<f32>(padded_rows)
+            .ok_or("FP8 attention row scales exceed arena")?
+    };
+    let mut weights = unsafe {
+        weight_arena
+            .transmute_mut::<u8>(3 * MODEL_WIDTH * MODEL_WIDTH)
+            .ok_or("FP8 attention projection weights exceed arena")?
+    };
+    let mut scales = unsafe {
+        scale_arena
+            .transmute_mut::<f32>(3 * MODEL_WIDTH)
+            .ok_or("FP8 attention projection scales exceed arena")?
+    };
+    let mut key_arena = unsafe {
+        key_arena
+            .transmute_mut::<u8>(qkv_key_arena_bytes(padded_rows))
+            .ok_or("packed key arena exceeds key buffer")?
+    };
+    launch_norm_quantize_fp8(
+        stream,
+        &kernels.layer_norm_quantize_fp8,
+        &buffers.state_a,
+        &layer.norm_attention_weight,
+        &layer.norm_attention_bias,
+        &mut activations,
+        &mut row_scales,
+        rows,
+        padded_rows,
+    )?;
+    for (index, weight) in [&layer.query, &layer.key, &layer.value]
+        .into_iter()
+        .enumerate()
+    {
+        let mut packed = weights.slice_mut(index * MODEL_WIDTH * MODEL_WIDTH..);
+        let mut packed_scales = scales.slice_mut(index * MODEL_WIDTH..);
+        let mut builder = stream.launch_builder(&kernels.quantize_rows1024);
+        builder.arg(weight).arg(&mut packed).arg(&mut packed_scales);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (MODEL_WIDTH as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }?;
+    }
+    let activations = activations.slice(..);
+    let weights = weights.slice(..);
+    let scales = scales.slice(..);
+    let row_scales = row_scales.slice(..);
+    let (mut packed_key, mut key_scale_bytes) = key_arena.split_at_mut(row_values);
+    let mut key_scales = unsafe {
+        key_scale_bytes
+            .transmute_mut::<f32>(padded_rows * 8)
+            .ok_or("packed key scales exceed key buffer")?
+    };
+    let mut value_t = buffers.state_b.slice_mut(..row_values);
+    let rows_i32 = i32::try_from(padded_rows)?;
+    let mut builder = stream.launch_builder(&kernels.qkv_fp8);
+    builder
+        .arg(&activations)
+        .arg(&weights)
+        .arg(&scales)
+        .arg(&row_scales)
+        .arg(&mut query)
+        .arg(&mut packed_key)
+        .arg(&mut key_scales)
+        .arg(&mut value_t)
+        .arg(&rows_i32);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                (3 * MODEL_WIDTH / 128) as u32,
+                u32::try_from(padded_rows.div_ceil(128))?,
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 128 * 136 * size_of::<f16>() as u32,
+        })
+    }?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_attention_arena(
     stream: &CudaStream,
@@ -1846,6 +1988,7 @@ fn launch_attention_arena(
     key: &CudaView<'_, f16>,
     value: &CudaView<'_, f16>,
     value_fp8: Option<&CudaView<'_, u8>>,
+    prepacked_key: Option<&CudaView<'_, u8>>,
     position: &CudaView<'_, f16>,
     bias_u: &CudaView<'_, f16>,
     bias_v: &CudaView<'_, f16>,
@@ -1879,22 +2022,24 @@ fn launch_attention_arena(
     };
     if let Some(arena) = packed.as_mut() {
         let (mut keys, mut positions) = arena.split_at_mut(position_offset);
-        let (mut values, mut scales) = keys.split_at_mut(key_bytes);
-        let vectors = i32::try_from(key_bytes / 128)?;
-        let config = LaunchConfig {
-            grid_dim: (u32::try_from(padded_rows)?, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(pack_key)
-                .arg(key)
-                .arg(&mut values)
-                .arg(&mut scales)
-                .arg(&vectors)
-                .launch(config)
-        }?;
+        if prepacked_key.is_none() {
+            let (mut values, mut scales) = keys.split_at_mut(key_bytes);
+            let vectors = i32::try_from(key_bytes / 128)?;
+            let config = LaunchConfig {
+                grid_dim: (u32::try_from(padded_rows)?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(pack_key)
+                    .arg(key)
+                    .arg(&mut values)
+                    .arg(&mut scales)
+                    .arg(&vectors)
+                    .launch(config)
+            }?;
+        }
         let (mut values, mut scales) = positions.split_at_mut(position_bytes);
         let vectors = i32::try_from(position_bytes / 128)?;
         let config = LaunchConfig {
@@ -1912,10 +2057,16 @@ fn launch_attention_arena(
                 .launch(config)
         }?;
     }
-    let packed_key = packed.as_ref().map(|arena| arena.slice(..key_bytes));
-    let key_scales = packed
-        .as_ref()
-        .map(|arena| arena.slice(key_bytes..position_offset));
+    let packed_key = prepacked_key
+        .map(|arena| arena.slice(..key_bytes))
+        .or_else(|| packed.as_ref().map(|arena| arena.slice(..key_bytes)));
+    let key_scales = prepacked_key
+        .map(|arena| arena.slice(key_bytes..position_offset))
+        .or_else(|| {
+            packed
+                .as_ref()
+                .map(|arena| arena.slice(key_bytes..position_offset))
+        });
     let packed_position = packed
         .as_ref()
         .map(|arena| arena.slice(position_offset..position_offset + position_bytes));

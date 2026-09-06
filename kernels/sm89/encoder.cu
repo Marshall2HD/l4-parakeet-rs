@@ -796,7 +796,10 @@ __device__ __forceinline__ void ffn_fp8_async(
     int dynamic_scale,
     const float* bias = nullptr,
     int valid_rows = 0,
-    int inner_width = kInputWidth) {
+    int inner_width = kInputWidth,
+    uint8_t* __restrict__ packed_key = nullptr,
+    float* __restrict__ key_scales = nullptr,
+    __half* __restrict__ value_t = nullptr) {
     constexpr int kTileRows = 128;
     constexpr int kTileColumns = 128;
     constexpr int kTileInner = 64;
@@ -941,6 +944,114 @@ __device__ __forceinline__ void ffn_fp8_async(
                 const float gate = __half2float(expanded[local_row * 128 + feature + 64]);
                 output[(row + local_row) * 1024 + column + feature] = row + local_row < valid_rows
                     ? __float2half_rn(value / (1.0f + expf(-gate))) : __float2half_rn(0.0f);
+            }
+        }
+        return;
+    }
+
+    if constexpr (kEpilogue == 9) {
+        // Fused Q/K/V projection. Each 128-column tile is exactly one head of
+        // one projection: blockIdx.x 0-7 query, 8-15 key, 16-23 value. Query
+        // keeps its FP16 row-major layout. Key and value tiles are FP16-rounded
+        // into shared storage first; a 136-half row pitch spreads the eight
+        // fragment rows of every store across distinct banks.
+        const int projection = static_cast<int>(blockIdx.x) >> 3;
+        const int head = static_cast<int>(blockIdx.x) & 7;
+        constexpr int kStagePitch = 136;
+        auto* staged = reinterpret_cast<__half*>(shared_bytes);
+        if (projection != 0) {
+            // All cp.async and ldmatrix readers finish before the arena is reused.
+            __syncthreads();
+        }
+#pragma unroll
+        for (int row_tile = 0; row_tile < 2; ++row_tile) {
+            const int local_row = warp_row + row_tile * 16;
+            const int output_row = row + local_row;
+            if (output_row >= rows) continue;
+            const float row_scale0 = input_scales[output_row + group];
+            const float row_scale1 = input_scales[output_row + group + 8];
+#pragma unroll
+            for (int column_tile = 0; column_tile < 8; ++column_tile) {
+                const int local_column = warp_column + column_tile * 8 + thread_in_group * 2;
+                const int weight_column = column + local_column;
+                const float weight_scale0 = weight_scales[weight_column];
+                const float weight_scale1 = weight_scales[weight_column + 1];
+                const float* a = accumulators[row_tile][column_tile];
+                const __half2 rounded0 = __floats2half2_rn(
+                    a[0] * row_scale0 * weight_scale0, a[1] * row_scale0 * weight_scale1);
+                const __half2 rounded1 = __floats2half2_rn(
+                    a[2] * row_scale1 * weight_scale0, a[3] * row_scale1 * weight_scale1);
+                if (projection == 0) {
+                    const int feature = head * kHeadWidth + local_column;
+                    *reinterpret_cast<__half2*>(
+                        output + (output_row + group) * kModelWidth + feature) = rounded0;
+                    *reinterpret_cast<__half2*>(
+                        output + (output_row + group + 8) * kModelWidth + feature) = rounded1;
+                } else {
+                    *reinterpret_cast<__half2*>(
+                        staged + (local_row + group) * kStagePitch + local_column) = rounded0;
+                    *reinterpret_cast<__half2*>(
+                        staged + (local_row + group + 8) * kStagePitch + local_column) = rounded1;
+                }
+            }
+        }
+        if (projection == 0) return;
+        __syncthreads();
+        if (projection == 1) {
+            // Signed INT4 key pack, identical arithmetic and byte layout to
+            // pk_sm89_pack_key_int4: two lanes share one row, one row max per
+            // (row, head) vector, scale max/7, nibbles in K64 MMA operand order.
+            const int local_row = static_cast<int>(threadIdx.x) >> 1;
+            const int half = static_cast<int>(threadIdx.x) & 1;
+            const __half2* source =
+                reinterpret_cast<const __half2*>(staged + local_row * kStagePitch + half * 64);
+            float maximum = 0.0f;
+#pragma unroll
+            for (int pair = 0; pair < 32; ++pair) {
+                const float2 v = __half22float2(source[pair]);
+                maximum = fmaxf(maximum, fmaxf(fabsf(v.x), fabsf(v.y)));
+            }
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
+            const float scale = maximum > 0.0f ? maximum / 7.0f : 1.0f;
+            if (row + local_row < rows) {
+                const int vector = (row + local_row) * kHeads + head;
+                if (half == 0) key_scales[vector] = scale;
+                uint32_t words[8];
+#pragma unroll
+                for (int quad = 0; quad < 4; ++quad) {
+                    uint32_t low = 0, high = 0;
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const float2 lo = __half22float2(source[quad * 4 + pair]);
+                        const float2 hi = __half22float2(source[16 + quad * 4 + pair]);
+                        low |= (uint32_t(__float2int_rn(lo.x / scale)) & 15u) << (8 * pair);
+                        low |= (uint32_t(__float2int_rn(lo.y / scale)) & 15u) << (8 * pair + 4);
+                        high |= (uint32_t(__float2int_rn(hi.x / scale)) & 15u) << (8 * pair);
+                        high |= (uint32_t(__float2int_rn(hi.y / scale)) & 15u) << (8 * pair + 4);
+                    }
+                    words[quad * 2] = low;
+                    words[quad * 2 + 1] = high;
+                }
+                auto* destination = reinterpret_cast<uint4*>(packed_key + vector * 64 + half * 32);
+                destination[0] = make_uint4(words[0], words[1], words[2], words[3]);
+                destination[1] = make_uint4(words[4], words[5], words[6], words[7]);
+            }
+            return;
+        }
+        // Feature-major FP16 value rows, the layout the value quantizer and
+        // scalar boundary tiles already consume. Lanes own rows l, l+32, ...
+        // so each warp store instruction covers 64 contiguous bytes.
+        const int tile_rows = min(kTileRows, rows - row);
+#pragma unroll 4
+        for (int item = 0; item < 16; ++item) {
+            const int local_column = warp * 16 + item;
+            __half* destination = value_t + size_t(head * kHeadWidth + local_column) * rows + row;
+#pragma unroll
+            for (int part = 0; part < 4; ++part) {
+                const int local_row = lane + part * 32;
+                if (local_row < tile_rows) {
+                    destination[local_row] = staged[local_row * kStagePitch + local_column];
+                }
             }
         }
         return;
@@ -1116,6 +1227,18 @@ void pk_sm89_subsample_pointwise_fp8(
     const float* input_scales, const float* bias, __half* output, int rows) {
     ffn_fp8_async<256, 256, 4>(
         input, weight, weight_scales, input_scales, output, rows, 1.0f, 1, bias);
+}
+
+// One launch projects query, key and value from the FP8 attention input.
+// Dynamic shared memory is 128 x 136 halves so the staged tile has bank slack.
+extern "C" __global__ __launch_bounds__(256, 2)
+void pk_sm89_qkv_fp8(
+    const uint8_t* input, const uint8_t* weight, const float* weight_scales,
+    const float* input_scales, __half* query, uint8_t* packed_key, float* key_scales,
+    __half* value_t, int rows) {
+    ffn_fp8_async<1024, 3072, 9>(
+        input, weight, weight_scales, input_scales, query, rows, 1.0f, 1, nullptr, 0, 1024,
+        packed_key, key_scales, value_t);
 }
 
 extern "C" __global__ __launch_bounds__(256, 2)
@@ -1497,6 +1620,19 @@ __device__ __forceinline__ void mma_m16n8k32_int8(
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// Scalar boundary tiles of the packed kernel consume the same signed INT4 key
+// vectors as the interior Tensor Core tiles; the FP16 key is never materialized.
+__device__ __forceinline__ float2 unpack_key_pair(
+    const uint8_t* __restrict__ packed_key, int vector, int dimension, float scale) {
+    const int within = dimension & 63;
+    const int byte = (dimension >> 6) * 32 + ((within & 31) >> 3) * 8 + (within >> 5) * 4 +
+        ((within & 7) >> 1);
+    const unsigned packed = packed_key[vector * 64 + byte];
+    const int low = static_cast<int>((packed & 15u) ^ 8u) - 8;
+    const int high = static_cast<int>(((packed >> 4) & 15u) ^ 8u) - 8;
+    return make_float2(static_cast<float>(low) * scale, static_cast<float>(high) * scale);
+}
+
 template<bool kPackedOutput>
 __device__ __forceinline__ void local_relpos_attention_tc_scores(
     const __half* __restrict__ query,
@@ -1592,6 +1728,8 @@ __device__ __forceinline__ void local_relpos_attention_tc_scores(
                 const int load_slot = min(slot, key_count - 1);
                 const int key_row = first_key + load_slot;
                 const int position_row = attention_left - query_row + key_row;
+                const int key_vector = key_row * kHeads + head;
+                const float key_scale = kPackedOutput ? key_scales[key_vector] : 0.0f;
                 float score = 0.0f;
 #pragma unroll
                 for (int quarter = 0; quarter < 4; ++quarter) {
@@ -1600,8 +1738,9 @@ __device__ __forceinline__ void local_relpos_attention_tc_scores(
                         key_row * kModelWidth + head * kHeadWidth + dimension;
                     const int position_index =
                         (head * kPositionRowsPadded + position_row) * kHeadWidth + dimension;
-                    const float2 key_pair = __half22float2(
-                        *reinterpret_cast<const __half2*>(key + key_index));
+                    const float2 key_pair = kPackedOutput
+                        ? unpack_key_pair(packed_key, key_vector, dimension, key_scale)
+                        : __half22float2(*reinterpret_cast<const __half2*>(key + key_index));
                     const float2 position_pair = __half22float2(
                         *reinterpret_cast<const __half2*>(position + position_index));
                     score = fmaf(scalar_query_u[quarter].x, key_pair.x, score);

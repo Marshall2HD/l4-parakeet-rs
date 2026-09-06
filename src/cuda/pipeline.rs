@@ -248,6 +248,7 @@ impl PipelineEngine {
                 pack_key: encoder_module.load_function("pk_sm89_pack_key_int4")?,
                 attention_output_fp8: encoder_module
                     .load_function("pk_sm89_attention_output_fp8")?,
+                qkv_fp8: encoder_module.load_function("pk_sm89_qkv_fp8")?,
                 linear: linear.clone(),
                 linear_large: linear_module.load_function("pk_sm89_fp16_linear_epilogue_m64")?,
                 qkv: linear_module.load_function("pk_sm89_fp16_qkv")?,
