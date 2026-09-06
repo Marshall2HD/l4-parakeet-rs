@@ -1,0 +1,16 @@
+# Allow only inputs consumed by the Dockerfile.
+*
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!LICENSE
+!src/
+!src/**
+!kernels/
+!kernels/**
+!scripts/
+!scripts/convert_nemo_v2.py
+!docs/
+!docs/benchmarks/
+!docs/benchmarks/night-circus-1h.json

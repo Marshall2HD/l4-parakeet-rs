@@ -1,0 +1,10 @@
+/target/
+/models/
+/.venv/
+/.autoresearch/
+__pycache__/
+*.pyc
+*.pkl4
+*.nemo
+*.safetensors
+.DS_Store

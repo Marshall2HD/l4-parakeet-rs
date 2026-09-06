@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "purpose": "fixed end-to-end L4 optimization and quality benchmark",
+  "audio": {
+    "name": "night-circus-1h-16k-mono.wav",
+    "bytes": 115200452,
+    "blake3": "e2195ed4f6541b17a067fe0199e343751aab26aa0de188de6212d38861b02ac0",
+    "duration_seconds": 3600,
+    "encoding": "pcm_s16le",
+    "channels": 1,
+    "sample_rate_hz": 16000
+  },
+  "reference": {
+    "name": "night-circus-book.txt",
+    "bytes": 694719,
+    "blake3": "cb8487cecf2ee9a4a0e75c04168fbe00dfce2a3269eaa085b3eaa73d8fa938e4",
+    "alignment_anchor": "the circus arrives without warning"
+  },
+  "scoring": {
+    "normalization": "lowercase and remove punctuation using the established Night Circus evaluator",
+    "alignment": "start at alignment_anchor and compare matching-length reference text",
+    "minimum_reference_coverage": 0.99,
+    "maximum_absolute_wer_regression": 0.002
+  },
+  "performance": {
+    "metric": "median warm end-to-end GPU processing time",
+    "trials": 5,
+    "minimum_relative_improvement": 0.02
+  },
+  "optimization_baseline": {
+    "implementation": "bespoke Rust/CUDA v2 FP16 pipeline",
+    "artifact_blake3": "0bed87c0913040a38ccdb303e19ccdfacdd9aaf7d5281b054fed7f49a3b2cb1b",
+    "wer": 0.014200211242811877,
+    "word_edits": 121,
+    "scored_words": 8521,
+    "median_latency_ms": 8567.1064453125,
+    "realtime_factor": 420.21189102532315
+  },
+  "known_quality_references": [
+    {
+      "implementation": "FluidAudio Parakeet TDT 0.6B v2",
+      "wer": 0.0180857,
+      "scored_words": 8515,
+      "processing_seconds": 31.428
+    },
+    {
+      "implementation": "FluidAudio Parakeet TDT 0.6B v3",
+      "wer": 0.205188,
+      "scored_words": 7749,
+      "processing_seconds": 37.934,
+      "note": "runtime-specific incomplete transcript; not evidence against the v3 checkpoint itself"
+    }
+  ]
+}
