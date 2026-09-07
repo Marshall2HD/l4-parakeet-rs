@@ -51,3 +51,4 @@ jobs:
             docker tag "$source" "$image:$revision"
             docker push "$image:$revision"
             docker push "$image:$channel"
+          done
