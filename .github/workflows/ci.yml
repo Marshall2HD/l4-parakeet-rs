@@ -12,11 +12,42 @@ jobs:
       - run: cargo +1.88.0 test --locked --all-targets
       - run: cargo +1.88.0 clippy --locked --all-targets -- -D warnings
   docker:
+    needs: rust
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - run: docker build --platform linux/amd64 --target runtime -t l4-parakeet-rs:ci .
       - run: docker run --rm l4-parakeet-rs:ci --help
       - run: docker build --platform linux/amd64 --target converter -t l4-parakeet-rs:converter .
       - run: docker run --rm l4-parakeet-rs:converter --help
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified runtime and converter images
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}"
+          for target in runtime converter; do
+            if [ "$target" = runtime ]; then
+              source=l4-parakeet-rs:ci
+              channel=latest
+              revision="sha-${REVISION}"
+            else
+              source=l4-parakeet-rs:converter
+              channel=converter
+              revision="converter-sha-${REVISION}"
+            fi
+            docker tag "$source" "$image:$channel"
+            docker tag "$source" "$image:$revision"
+            docker push "$image:$revision"
+            docker push "$image:$channel"

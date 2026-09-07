@@ -23,6 +23,22 @@ implementation and does not claim numerical parity with stock NeMo.
 
 ## Build the container
 
+GitHub Actions builds and smoke-tests both images, then publishes successful
+`main` builds to GHCR:
+
+```sh
+docker pull ghcr.io/marshall2hd/l4-parakeet-rs:latest
+docker pull ghcr.io/marshall2hd/l4-parakeet-rs:converter
+```
+
+Runtime builds also receive `sha-<full-commit>` tags; converter builds receive
+`converter-sha-<full-commit>` tags. Pin a registry digest for deployments rather
+than following `latest`. Images contain code and dependencies, **not model weights**.
+The MIT license covers this project's code; bundled dependencies and NVIDIA CUDA
+remain subject to their own licenses. Pull requests build/test without publishing.
+
+To build from source instead:
+
 ```sh
 git clone https://github.com/Marshall2HD/l4-parakeet-rs.git
 cd l4-parakeet-rs
