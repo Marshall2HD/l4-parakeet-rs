@@ -353,17 +353,30 @@ fn part_name(headers: &[u8]) -> Result<String, ApiError> {
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (!needle.is_empty() && haystack.len() >= needle.len())
         .then(|| {
-            haystack[..haystack.len() - needle.len() + 1]
-                .chunks(64)
-                .enumerate()
-                .filter(|(_, chunk)| chunk.contains(&needle[0]))
-                .find_map(|(chunk_index, chunk)| {
-                    chunk.iter().enumerate().find_map(|(index, &byte)| {
-                        let offset = chunk_index * 64 + index;
-                        (byte == needle[0] && haystack[offset..].starts_with(needle))
-                            .then_some(offset)
-                    })
-                })
+            let starts = &haystack[..haystack.len() - needle.len() + 1];
+            let mut chunks = starts.chunks_exact(16);
+            let first = u128::from_le_bytes([needle[0]; 16]);
+            const ONES: u128 = u128::from_le_bytes([0x01; 16]);
+            const HIGHS: u128 = u128::from_le_bytes([0x80; 16]);
+            for (chunk_index, chunk) in chunks.by_ref().enumerate() {
+                let word = u128::from_le_bytes(chunk.try_into().unwrap()) ^ first;
+                // Every zero byte sets its high bit. Borrow propagation can add
+                // candidates, which the full delimiter comparison rejects.
+                let mut candidates = word.wrapping_sub(ONES) & !word & HIGHS;
+                while candidates != 0 {
+                    let offset = chunk_index * 16 + candidates.trailing_zeros() as usize / 8;
+                    if haystack[offset..].starts_with(needle) {
+                        return Some(offset);
+                    }
+                    candidates &= candidates - 1;
+                }
+            }
+            let remainder = chunks.remainder();
+            let remainder_start = starts.len() - remainder.len();
+            remainder.iter().enumerate().find_map(|(index, &byte)| {
+                let offset = remainder_start + index;
+                (byte == needle[0] && haystack[offset..].starts_with(needle)).then_some(offset)
+            })
         })
         .flatten()
 }
@@ -701,6 +714,51 @@ mod tests {
         assert_eq!(find_bytes(needle, b""), None);
         assert_eq!(find_bytes(b"abc\0\xff", b"\0\xff"), Some(3));
         assert_eq!(find_bytes(b"abc", b"c"), Some(2));
+    }
+
+    #[test]
+    fn delimiter_mask_matches_scalar_search_for_all_byte_pairs() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let mut body = [0; 48];
+                for pair in body.chunks_exact_mut(2) {
+                    pair.copy_from_slice(&[first, second]);
+                }
+                for needle in [b"\r\n".as_slice(), b"\0\x01", b"\xff\xfe"] {
+                    assert_eq!(
+                        find_bytes(&body, needle),
+                        body.windows(needle.len())
+                            .position(|window| window == needle)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delimiter_mask_matches_scalar_search_at_unaligned_edges() {
+        let mut bytes = [0; 512];
+        let mut state = 1u32;
+        for byte in &mut bytes {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        for alignment in 0..16 {
+            for length in 0..256 {
+                let body = &bytes[alignment..alignment + length];
+                for needle_len in 0..=76 {
+                    let start = length / 2;
+                    let needle = &bytes[alignment + start..alignment + start + needle_len];
+                    let expected = if needle.is_empty() {
+                        None
+                    } else {
+                        body.windows(needle.len())
+                            .position(|window| window == needle)
+                    };
+                    assert_eq!(find_bytes(body, needle), expected);
+                }
+            }
+        }
     }
 
     #[test]
