@@ -500,7 +500,7 @@ __device__ __forceinline__ void tdt_persistent_fp8(
     __shared__ int reduction_ids[kWarpsPerBlock];
 
     // The long path never uses gate scratch. Keep two quantized H banks here;
-    // FP32 H/C remain authoritative for cell updates and prediction projection.
+    // FP32 H/C remain authoritative for cell updates and the FP16 projection.
     int8_t* packed_h = reinterpret_cast<int8_t*>(workspace + kGateScratch);
     for (int index = global_thread; index < 8 * kHidden; index += global_threads) {
         workspace[index] = 0.0f;
@@ -584,6 +584,37 @@ __device__ __forceinline__ void tdt_persistent_fp8(
     }
     const __half* projection_row = decoder_projection_weight + unit * kHidden;
     const float projection_bias = decoder_projection_bias[unit];
+    // The protected band includes 1024..1039 valid frames on this kernel.
+    // Pack one immutable INT8 row per warp inside each longer request.
+    const bool use_dp4a_projection = frames >= 1040;
+    float projection_scale = 1.0f;
+    uint32_t packed_projection_words[5];
+    if (use_dp4a_projection) {
+        float projection_maximum = 0.0f;
+#pragma unroll
+        for (int word = 0; word < 10; ++word) {
+            const float2 values = __half22float2(*reinterpret_cast<const __half2*>(
+                projection_row + 2 * lane + 64 * word));
+            projection_maximum = fmaxf(projection_maximum, fmaxf(fabsf(values.x), fabsf(values.y)));
+        }
+        for (int width = 16; width; width /= 2) {
+            projection_maximum = fmaxf(
+                projection_maximum, __shfl_down_sync(0xffffffff, projection_maximum, width));
+        }
+        projection_maximum = __shfl_sync(0xffffffff, projection_maximum, 0);
+        projection_scale = projection_maximum > 0.0f ? projection_maximum / 127.0f : 1.0f;
+#pragma unroll
+        for (int step = 0; step < 5; ++step) {
+            const uint2 halves = *reinterpret_cast<const uint2*>(projection_row + 4 * lane + 128 * step);
+            const float2 low = unpack_half2(halves.x);
+            const float2 high = unpack_half2(halves.y);
+            packed_projection_words[step] =
+                static_cast<uint32_t>(static_cast<uint8_t>(quantize_i8(low.x / projection_scale))) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(quantize_i8(low.y / projection_scale))) << 8) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(quantize_i8(high.x / projection_scale))) << 16) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(quantize_i8(high.y / projection_scale))) << 24);
+        }
+    }
     const int half = lane >> 4;
     const int half_lane = lane & 15;
     const int joint_output = 2 * global_warp + half;
@@ -646,12 +677,15 @@ __device__ __forceinline__ void tdt_persistent_fp8(
             grid.sync();
 
             // Layer 1: only the cached input projection of the new layer-0
-            // output remains on the critical path; prefetch the projection row.
+            // output remains on the critical path; prefetch the FP16 row only
+            // in the protected band, otherwise its INT8 words are cached.
             uint32_t projection_words[10];
+            if (!use_dp4a_projection) {
 #pragma unroll
-            for (int word = 0; word < 10; ++word) {
-                projection_words[word] =
-                    *reinterpret_cast<const uint32_t*>(projection_row + 2 * lane + 64 * word);
+                for (int word = 0; word < 10; ++word) {
+                    projection_words[word] =
+                        *reinterpret_cast<const uint32_t*>(projection_row + 2 * lane + 64 * word);
+                }
             }
 #pragma unroll
             for (int gate = 0; gate < 4; ++gate) {
@@ -671,13 +705,24 @@ __device__ __forceinline__ void tdt_persistent_fp8(
 
             // Prediction projection of the new layer-1 output.
             float sum = lane == 0 ? projection_bias : 0.0f;
+            if (use_dp4a_projection) {
+                int dot = 0;
 #pragma unroll
-            for (int word = 0; word < 10; ++word) {
-                const float2 weights = unpack_half2(projection_words[word]);
-                const float2 values = *reinterpret_cast<const float2*>(
-                    candidate_h + kHidden + 2 * lane + 64 * word);
-                sum = fmaf(weights.x, values.x, sum);
-                sum = fmaf(weights.y, values.y, sum);
+                for (int word = 0; word < 5; ++word) {
+                    const int values = *reinterpret_cast<const int*>(
+                        packed_candidate_h + kHidden + 4 * lane + 128 * word);
+                    dot = __dp4a(static_cast<int>(packed_projection_words[word]), values, dot);
+                }
+                sum = float(dot) * (projection_scale / 127.0f) + sum;
+            } else {
+#pragma unroll
+                for (int word = 0; word < 10; ++word) {
+                    const float2 weights = unpack_half2(projection_words[word]);
+                    const float2 values = *reinterpret_cast<const float2*>(
+                        candidate_h + kHidden + 2 * lane + 64 * word);
+                    sum = fmaf(weights.x, values.x, sum);
+                    sum = fmaf(weights.y, values.y, sum);
+                }
             }
             sum = warp_sum(sum);
             if (owns_unit && lane == 0) {
