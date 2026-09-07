@@ -353,9 +353,17 @@ fn part_name(headers: &[u8]) -> Result<String, ApiError> {
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (!needle.is_empty() && haystack.len() >= needle.len())
         .then(|| {
-            haystack
-                .windows(needle.len())
-                .position(|window| window == needle)
+            haystack[..haystack.len() - needle.len() + 1]
+                .chunks(64)
+                .enumerate()
+                .filter(|(_, chunk)| chunk.contains(&needle[0]))
+                .find_map(|(chunk_index, chunk)| {
+                    chunk.iter().enumerate().find_map(|(index, &byte)| {
+                        let offset = chunk_index * 64 + index;
+                        (byte == needle[0] && haystack[offset..].starts_with(needle))
+                            .then_some(offset)
+                    })
+                })
         })
         .flatten()
 }
@@ -484,6 +492,7 @@ pub fn serve(
     max_audio_seconds: usize,
     max_upload_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
+    use crate::audio::decode_pcm16_mono_into;
     use crate::cuda::PipelineEngine;
     use std::io::Read;
     use tiny_http::{Header, Method, Response, Server, StatusCode};
@@ -500,6 +509,8 @@ pub fn serve(
         .map_err(|error| format!("failed to bind HTTP server at {address}: {error}"))?;
     eprintln!("parakeet-l4: listening on http://{address} ({MODEL_ID}, max {max_audio_seconds}s)");
 
+    let mut body = Vec::new();
+    let mut samples = Vec::new();
     let mut sequence = 0_u64;
     for mut request in server.incoming_requests() {
         sequence = sequence.wrapping_add(1);
@@ -542,9 +553,8 @@ pub fn serve(
                 {
                     Err(ApiError::payload_too_large(max_upload_bytes))
                 } else {
-                    let mut body = Vec::with_capacity(
-                        request.body_length().unwrap_or(0).min(max_upload_bytes),
-                    );
+                    body.clear();
+                    body.reserve(request.body_length().unwrap_or(0).min(max_upload_bytes));
                     let read_result = request
                         .as_reader()
                         .take(u64::try_from(max_upload_bytes)? + 1)
@@ -560,7 +570,7 @@ pub fn serve(
                         }
                         Ok(_) => match parse_transcription_form(&content_type, &body) {
                             Err(error) => Err(error),
-                            Ok(form) => match crate::audio::decode_pcm16_mono(form.audio) {
+                            Ok(form) => match decode_pcm16_mono_into(form.audio, &mut samples) {
                                 Err(error) => Err(ApiError::invalid(
                                     format!(
                                         "could not decode audio; only 16 kHz mono PCM16 WAV is supported: {error}"
@@ -568,15 +578,12 @@ pub fn serve(
                                     Some("file"),
                                     "invalid_audio",
                                 )),
-                                Ok(audio) if audio.sample_rate != 16_000 => Err(ApiError::invalid(
-                                    format!(
-                                        "input sample rate is {}, expected 16000",
-                                        audio.sample_rate
-                                    ),
+                                Ok(sample_rate) if sample_rate != 16_000 => Err(ApiError::invalid(
+                                    format!("input sample rate is {sample_rate}, expected 16000"),
                                     Some("file"),
                                     "unsupported_sample_rate",
                                 )),
-                                Ok(audio) if audio.samples.len() > engine.max_samples() => {
+                                Ok(_) if samples.len() > engine.max_samples() => {
                                     Err(ApiError::invalid(
                                         format!(
                                             "audio duration exceeds the configured {max_audio_seconds}-second maximum"
@@ -585,7 +592,7 @@ pub fn serve(
                                         "audio_too_long",
                                     ))
                                 }
-                                Ok(audio) => match engine.transcribe(&audio.samples) {
+                                Ok(_) => match engine.transcribe(&samples) {
                                     Ok(transcription) => {
                                         eprintln!(
                                             "parakeet-l4: {request_id} transcribed {:.3}s in {:.3} ms",
@@ -674,6 +681,23 @@ mod tests {
         assert_eq!(form.audio, audio);
         assert_eq!(form.format, ResponseFormat::VerboseJson);
         assert!(form.include_words);
+    }
+
+    #[test]
+    fn finds_binary_delimiters_across_scan_chunks() {
+        let needle = b"\r\n--parakeet-boundary";
+        for offset in 0..192 {
+            let mut body = vec![b'\r'; offset];
+            body.extend_from_slice(needle);
+            body.extend_from_slice(needle);
+            assert_eq!(find_bytes(&body, needle), Some(offset));
+            body.truncate(offset + needle.len() - 1);
+            assert_eq!(find_bytes(&body, needle), None);
+        }
+        assert_eq!(find_bytes(b"", needle), None);
+        assert_eq!(find_bytes(needle, b""), None);
+        assert_eq!(find_bytes(b"abc\0\xff", b"\0\xff"), Some(3));
+        assert_eq!(find_bytes(b"abc", b"c"), Some(2));
     }
 
     #[test]

@@ -28,6 +28,15 @@ pub fn read_pcm16_mono(path: &Path) -> Result<Audio, AudioError> {
 }
 
 pub fn decode_pcm16_mono(bytes: &[u8]) -> Result<Audio, AudioError> {
+    let mut samples = Vec::new();
+    let sample_rate = decode_pcm16_mono_into(bytes, &mut samples)?;
+    Ok(Audio {
+        samples,
+        sample_rate,
+    })
+}
+
+pub fn decode_pcm16_mono_into(bytes: &[u8], samples: &mut Vec<f32>) -> Result<u32, AudioError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(AudioError::Invalid("expected RIFF/WAVE header".into()));
     }
@@ -93,14 +102,12 @@ pub fn decode_pcm16_mono(bytes: &[u8]) -> Result<Audio, AudioError> {
             "PCM payload has an odd byte count".into(),
         ));
     }
-    let samples = data
-        .chunks_exact(2)
-        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0)
-        .collect();
-    Ok(Audio {
-        samples,
-        sample_rate,
-    })
+    samples.clear();
+    samples.extend(
+        data.chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0),
+    );
+    Ok(sample_rate)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, AudioError> {
@@ -147,6 +154,36 @@ mod tests {
         let audio = decode_pcm16_mono(&wav).unwrap();
         assert_eq!(audio.sample_rate, 16_000);
         assert_eq!(audio.samples, [-1.0, 0.0, 0.5, 32767.0 / 32768.0]);
+    }
+
+    #[test]
+    fn reuses_samples_with_exact_pcm_values_and_no_stale_tail() {
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + 65_536 * 2u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(65_536 * 2u32).to_le_bytes());
+        for sample in i16::MIN..=i16::MAX {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut samples = Vec::new();
+        assert_eq!(decode_pcm16_mono_into(&wav, &mut samples).unwrap(), 16_000);
+        assert_eq!(samples.len(), 65_536);
+        for (actual, expected) in samples.iter().zip(i16::MIN..=i16::MAX) {
+            assert_eq!(actual.to_bits(), (expected as f32 / 32768.0).to_bits());
+        }
+        let allocation = samples.as_ptr();
+        wav.truncate(46);
+        wav[4..8].copy_from_slice(&38u32.to_le_bytes());
+        wav[40..44].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(decode_pcm16_mono_into(&wav, &mut samples).unwrap(), 16_000);
+        assert_eq!(samples, [-1.0]);
+        assert_eq!(samples.as_ptr(), allocation);
     }
 
     #[test]
