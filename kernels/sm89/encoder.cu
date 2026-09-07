@@ -218,7 +218,7 @@ __device__ __forceinline__ void layer_norm_quantize_dynamic(
     int rows,
     int padded_rows,
     float epsilon) {
-    const int row = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(gridDim.x - 1 - blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x);
     if (row >= padded_rows) {
         return;
@@ -784,7 +784,7 @@ __device__ __forceinline__ void mma_m16n8k64_int4(
 // Native E4M3 or packed S4 operands. kInputWidth counts stored bytes: the
 // same 32-byte operand fragments feed K32 FP8 or K64 INT4 instructions.
 // The 128x128 tile and two 64-byte cp.async stages retain two CTAs per L4 SM.
-template<int kInputWidth, int kOutputWidth, int kEpilogue, bool kInt4 = false>
+template<int kInputWidth, int kOutputWidth, int kEpilogue, bool kInt4 = false, bool kReverse = false>
 __device__ __forceinline__ void ffn_fp8_async(
     const uint8_t* __restrict__ input,
     const uint8_t* __restrict__ weight,
@@ -816,7 +816,7 @@ __device__ __forceinline__ void ffn_fp8_async(
     const int thread_in_group = lane & 3;
     const int warp_row = (warp >> 1) * 32;
     const int warp_column = (warp & 1) * 64;
-    const int row = static_cast<int>(blockIdx.y) * kTileRows;
+    const int row = static_cast<int>(kReverse ? gridDim.y - 1 - blockIdx.y : blockIdx.y) * kTileRows;
     const int column = static_cast<int>(blockIdx.x) * (kEpilogue == 5 ? 64 : kTileColumns);
 
     using Accumulator = std::conditional_t<kInt4, int32_t, float>;
@@ -1183,7 +1183,7 @@ extern "C" __global__ __launch_bounds__(256, 2)
 void pk_sm89_ffn_expand_fp8_packed(
     const uint8_t* input, const uint8_t* weight, const float* weight_scales,
     const float* input_scales, __half* output, int rows, float input_scale, int dynamic_scale) {
-    ffn_fp8_async<1024, 4096, 1>(
+    ffn_fp8_async<1024, 4096, 1, false, true>(
         input, weight, weight_scales, input_scales, output, rows, input_scale, dynamic_scale);
 }
 
@@ -1201,7 +1201,7 @@ void pk_sm89_ffn_contract_fp8_sparse(
     __half* output, int rows, int inner_width) {
     // The host supplies 4096. A runtime loop bound prevents ptxas from fully
     // unrolling the sparse mainloop into a spilling 1024-instruction MMA body.
-    ffn_fp8_async<4096, 1024, 8>(input, weight, weight_scales, nullptr, output,
+    ffn_fp8_async<4096, 1024, 8, false, true>(input, weight, weight_scales, nullptr, output,
         rows, 1.0f / 16.0f, 0, nullptr, 0, inner_width);
 }
 
@@ -1368,7 +1368,7 @@ void pk_sm89_depthwise_pack(
     int rows,
     int padded_rows,
     float epsilon) {
-    const int start = blockIdx.x * 8;
+    const int start = static_cast<int>(gridDim.x - 1 - blockIdx.x) * 8;
     float values[4][8] = {};
     // Own complete rows so packing can consume the rounded depthwise values
     // without materializing FP16 or changing the channel's FMA/BN/SiLU order.
@@ -1653,7 +1653,7 @@ __device__ __forceinline__ void local_relpos_attention_tc_scores(
     const uint8_t* packed_position = nullptr, const float* position_scales = nullptr) {
     constexpr int kQueryTile = 16;
     constexpr int kWarps = 8;
-    const int query_base = static_cast<int>(blockIdx.x) * kQueryTile;
+    const int query_base = static_cast<int>(kPackedOutput ? gridDim.x - 1 - blockIdx.x : blockIdx.x) * kQueryTile;
     const int head = static_cast<int>(blockIdx.y);
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
