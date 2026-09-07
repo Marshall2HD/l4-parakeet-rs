@@ -1006,10 +1006,14 @@ __device__ __forceinline__ void ffn_fp8_async(
             const __half2* source =
                 reinterpret_cast<const __half2*>(staged + local_row * kStagePitch + half * 64);
             float maximum = 0.0f;
+            // Rows past the end of a partial tile were never staged; both lanes
+            // of such a row keep zero and the shuffle below stays warp-uniform.
+            if (row + local_row < rows) {
 #pragma unroll
-            for (int pair = 0; pair < 32; ++pair) {
-                const float2 v = __half22float2(source[pair]);
-                maximum = fmaxf(maximum, fmaxf(fabsf(v.x), fabsf(v.y)));
+                for (int pair = 0; pair < 32; ++pair) {
+                    const float2 v = __half22float2(source[pair]);
+                    maximum = fmaxf(maximum, fmaxf(fabsf(v.x), fabsf(v.y)));
+                }
             }
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
             const float scale = maximum > 0.0f ? maximum / 7.0f : 1.0f;
