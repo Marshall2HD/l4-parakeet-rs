@@ -37,6 +37,17 @@ pub fn decode_pcm16_mono(bytes: &[u8]) -> Result<Audio, AudioError> {
 }
 
 pub fn decode_pcm16_mono_into(bytes: &[u8], samples: &mut Vec<f32>) -> Result<u32, AudioError> {
+    let (data, sample_rate) = pcm16_mono_data(bytes)?;
+    samples.clear();
+    samples.extend(
+        data.chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0),
+    );
+    Ok(sample_rate)
+}
+
+/// Validate the WAV contract and borrow its little-endian PCM16 payload.
+pub fn pcm16_mono_data(bytes: &[u8]) -> Result<(&[u8], u32), AudioError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(AudioError::Invalid("expected RIFF/WAVE header".into()));
     }
@@ -102,12 +113,7 @@ pub fn decode_pcm16_mono_into(bytes: &[u8], samples: &mut Vec<f32>) -> Result<u3
             "PCM payload has an odd byte count".into(),
         ));
     }
-    samples.clear();
-    samples.extend(
-        data.chunks_exact(2)
-            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0),
-    );
-    Ok(sample_rate)
+    Ok((data, sample_rate))
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, AudioError> {

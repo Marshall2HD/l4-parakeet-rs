@@ -492,7 +492,7 @@ pub fn serve(
     max_audio_seconds: usize,
     max_upload_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
-    use crate::audio::decode_pcm16_mono_into;
+    use crate::audio::pcm16_mono_data;
     use crate::cuda::PipelineEngine;
     use std::io::Read;
     use tiny_http::{Header, Method, Response, Server, StatusCode};
@@ -510,7 +510,6 @@ pub fn serve(
     eprintln!("parakeet-l4: listening on http://{address} ({MODEL_ID}, max {max_audio_seconds}s)");
 
     let mut body = Vec::new();
-    let mut samples = Vec::new();
     let mut sequence = 0_u64;
     for mut request in server.incoming_requests() {
         sequence = sequence.wrapping_add(1);
@@ -570,7 +569,7 @@ pub fn serve(
                         }
                         Ok(_) => match parse_transcription_form(&content_type, &body) {
                             Err(error) => Err(error),
-                            Ok(form) => match decode_pcm16_mono_into(form.audio, &mut samples) {
+                            Ok(form) => match pcm16_mono_data(form.audio) {
                                 Err(error) => Err(ApiError::invalid(
                                     format!(
                                         "could not decode audio; only 16 kHz mono PCM16 WAV is supported: {error}"
@@ -578,12 +577,16 @@ pub fn serve(
                                     Some("file"),
                                     "invalid_audio",
                                 )),
-                                Ok(sample_rate) if sample_rate != 16_000 => Err(ApiError::invalid(
-                                    format!("input sample rate is {sample_rate}, expected 16000"),
-                                    Some("file"),
-                                    "unsupported_sample_rate",
-                                )),
-                                Ok(_) if samples.len() > engine.max_samples() => {
+                                Ok((_, sample_rate)) if sample_rate != 16_000 => {
+                                    Err(ApiError::invalid(
+                                        format!(
+                                            "input sample rate is {sample_rate}, expected 16000"
+                                        ),
+                                        Some("file"),
+                                        "unsupported_sample_rate",
+                                    ))
+                                }
+                                Ok((pcm, _)) if pcm.len() / 2 > engine.max_samples() => {
                                     Err(ApiError::invalid(
                                         format!(
                                             "audio duration exceeds the configured {max_audio_seconds}-second maximum"
@@ -592,7 +595,7 @@ pub fn serve(
                                         "audio_too_long",
                                     ))
                                 }
-                                Ok(_) => match engine.transcribe(&samples) {
+                                Ok((pcm, _)) => match engine.transcribe_pcm16(pcm) {
                                     Ok(transcription) => {
                                         eprintln!(
                                             "parakeet-l4: {request_id} transcribed {:.3}s in {:.3} ms",

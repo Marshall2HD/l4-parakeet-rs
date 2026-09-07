@@ -2,7 +2,7 @@ use crate::config::FeatureExtractorConfig;
 use crate::frontend::MelFeatures;
 use cudarc::cufft::{CudaFft, result as cufft_result, sys as cufft_sys};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, sys,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg, sys,
 };
 use cudarc::nvrtc::Ptx;
 use serde::Serialize;
@@ -35,6 +35,20 @@ pub struct GpuFrontendReport {
     pub correctness_values: usize,
     pub max_abs_error: f32,
     pub mean_abs_error: f64,
+}
+
+pub(super) fn convert_pcm16(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    pcm: &CudaSlice<u8>,
+    samples: &mut CudaViewMut<'_, f32>,
+) -> Result<(), Box<dyn Error>> {
+    let sample_count = i32::try_from(samples.len())?;
+    let mut builder = stream.launch_builder(kernel);
+    builder.arg(pcm).arg(samples).arg(&sample_count);
+    // CUDA allocations are aligned for int16_t; the uploaded bytes are s16le on sm_89.
+    unsafe { builder.launch(LaunchConfig::for_num_elems(sample_count as u32)) }?;
+    Ok(())
 }
 
 pub fn benchmark_frontend(
@@ -313,4 +327,29 @@ pub(super) fn run_frontend(
         })
     }?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcm16_conversion_matches_cpu_bits_for_every_value() {
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let module = context
+            .load_module(Ptx::from_binary(FRONTEND_CUBIN.to_vec()))
+            .unwrap();
+        let kernel = module.load_function("pk_sm89_pcm16_to_f32").unwrap();
+        let pcm = (i16::MIN..=i16::MAX)
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let pcm = stream.clone_htod(&pcm).unwrap();
+        let mut samples = stream.alloc_zeros::<f32>(65_536).unwrap();
+        convert_pcm16(&stream, &kernel, &pcm, &mut samples.as_view_mut()).unwrap();
+        let actual = stream.clone_dtoh(&samples).unwrap();
+        for (actual, expected) in actual.iter().zip(i16::MIN..=i16::MAX) {
+            assert_eq!(actual.to_bits(), (expected as f32 / 32768.0).to_bits());
+        }
+    }
 }

@@ -9,6 +9,17 @@ constexpr int kHop = 160;
 constexpr int kMels = 128;
 
 extern "C" __global__
+void pk_sm89_pcm16_to_f32(
+    const int16_t* __restrict__ pcm,
+    float* __restrict__ samples,
+    int sample_count) {
+    const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index < sample_count) {
+        samples[index] = static_cast<float>(pcm[index]) / 32768.0f;
+    }
+}
+
+extern "C" __global__
 void pk_sm89_frame_window(
     const float* __restrict__ samples,
     const float* __restrict__ window,

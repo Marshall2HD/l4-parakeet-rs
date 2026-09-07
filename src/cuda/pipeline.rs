@@ -10,6 +10,7 @@ use std::error::Error;
 use std::mem::size_of;
 use std::path::Path;
 
+const PCM16_STAGING_BYTES: usize = 16 * 1024 * 1024;
 const ENCODER_LAYERS: usize = 24;
 // Quantizing the final FF1 expansion exceeded the dev-other quality gate.
 const FP8_FF1_LAYERS: usize = ENCODER_LAYERS - 1;
@@ -56,6 +57,7 @@ pub struct PipelineTranscription {
 }
 
 struct PipelineKernels {
+    pcm16_to_f32: CudaFunction,
     frame_window: CudaFunction,
     mel_log: CudaFunction,
     normalize: CudaFunction,
@@ -73,6 +75,8 @@ struct PipelineKernels {
 }
 
 struct PipelineWorkspace {
+    // Raw s16le bytes; the conversion kernel reads aligned int16_t values.
+    pcm16: CudaSlice<u8>,
     samples: CudaSlice<f32>,
     framed: CudaSlice<f32>,
     spectrum: CudaSlice<cufft_sys::float2>,
@@ -192,6 +196,7 @@ impl PipelineEngine {
             .load_module(Ptx::from_binary(SM89_CUBIN.to_vec()))?;
         let linear = linear_module.load_function("pk_sm89_fp16_linear_epilogue")?;
         let kernels = PipelineKernels {
+            pcm16_to_f32: frontend_module.load_function("pk_sm89_pcm16_to_f32")?,
             frame_window: frontend_module.load_function("pk_sm89_frame_window")?,
             mel_log: frontend_module.load_function("pk_sm89_mel_log_sparse")?,
             normalize: frontend_module.load_function("pk_sm89_normalize_mel")?,
@@ -279,6 +284,9 @@ impl PipelineEngine {
         let max_first_frames = 2 * max_second_frames + 1;
         let padded_tile_frames = subsampling::TILE_OUTPUT_FRAMES.next_multiple_of(16);
         let mut workspace = PipelineWorkspace {
+            pcm16: uploaded
+                .stream
+                .alloc_zeros((max_samples * 2).min(PCM16_STAGING_BYTES))?,
             samples: uploaded.stream.alloc_zeros(max_samples)?,
             framed: uploaded
                 .stream
@@ -397,11 +405,43 @@ impl PipelineEngine {
 
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<PipelineTranscription, Box<dyn Error>> {
         self.prepare_samples(samples)?;
+        self.transcribe_prepared(samples.len())
+    }
+
+    /// Transcribe a validated mono s16le payload without a host f32 conversion.
+    pub fn transcribe_pcm16(
+        &mut self,
+        pcm: &[u8],
+    ) -> Result<PipelineTranscription, Box<dyn Error>> {
+        let sample_count = pcm.len() / 2;
+        self.validate_sample_count(sample_count)?;
+        for (chunk, bytes) in pcm.chunks(self.workspace.pcm16.len()).enumerate() {
+            self.uploaded
+                .stream
+                .memcpy_htod(bytes, &mut self.workspace.pcm16)?;
+            let start = chunk * self.workspace.pcm16.len() / 2;
+            frontend::convert_pcm16(
+                &self.uploaded.stream,
+                &self.kernels.pcm16_to_f32,
+                &self.workspace.pcm16,
+                &mut self
+                    .workspace
+                    .samples
+                    .slice_mut(start..start + bytes.len() / 2),
+            )?;
+        }
+        self.transcribe_prepared(sample_count)
+    }
+
+    fn transcribe_prepared(
+        &mut self,
+        sample_count: usize,
+    ) -> Result<PipelineTranscription, Box<dyn Error>> {
         let started = self
             .uploaded
             .stream
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-        self.run_prepared(samples.len())?;
+        self.run_prepared(sample_count)?;
         let ended = self
             .uploaded
             .stream
@@ -412,23 +452,27 @@ impl PipelineEngine {
         Ok(PipelineTranscription {
             text,
             token_ids,
-            audio_seconds: samples.len() as f64 / self.config.sampling_rate as f64,
+            audio_seconds: sample_count as f64 / self.config.sampling_rate as f64,
             inference_latency_ms,
         })
     }
 
-    fn prepare_samples(&mut self, samples: &[f32]) -> Result<(), Box<dyn Error>> {
-        if samples.is_empty() {
+    fn validate_sample_count(&self, sample_count: usize) -> Result<(), Box<dyn Error>> {
+        if sample_count == 0 {
             return Err("audio must contain at least one sample".into());
         }
-        if samples.len() > self.max_samples {
+        if sample_count > self.max_samples {
             return Err(format!(
                 "audio has {} samples, exceeding the configured capacity of {}",
-                samples.len(),
-                self.max_samples
+                sample_count, self.max_samples
             )
             .into());
         }
+        Ok(())
+    }
+
+    fn prepare_samples(&mut self, samples: &[f32]) -> Result<(), Box<dyn Error>> {
+        self.validate_sample_count(samples.len())?;
         self.uploaded
             .stream
             .memcpy_htod(samples, &mut self.workspace.samples)?;
@@ -629,7 +673,8 @@ impl PipelineEngine {
 
     fn workspace_device_bytes(&self) -> usize {
         let workspace = &self.workspace;
-        workspace.samples.len() * size_of::<f32>()
+        workspace.pcm16.len() * size_of::<u8>()
+            + workspace.samples.len() * size_of::<f32>()
             + self.window.len() * size_of::<f32>()
             + self.filter_offsets.len() * size_of::<i32>()
             + self.filter_bins.len() * size_of::<i32>()
