@@ -16,8 +16,9 @@ implementation and does not claim numerical parity with stock NeMo.
 - **Build:** Docker on Linux x86_64; neither a GPU nor model weights is needed.
   Allow roughly 20 GB free disk for build images/caches and conversion.
 - **Model:** the pinned English `nvidia/parakeet-tdt-0.6b-v2` checkpoint below.
-  V3, arbitrary GPUs, CPU transcription, streaming, and batch inference are not
-  supported deployment targets. Requests are processed serially.
+  V3, arbitrary GPUs, CPU transcription, multilingual recognition, and true
+  streaming are not supported. Explicit short-clip batches share GPU encoder
+  work; separate HTTP requests are still processed serially.
 - **Audio:** 16 kHz, mono, signed 16-bit PCM WAV. The server does not run ffmpeg
   or accept arbitrary audio codecs. Maximum request duration defaults to one hour.
 
@@ -94,7 +95,7 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le input.wav
 docker run --rm --gpus all \
   -v "$PWD/models:/models:ro" -v "$PWD/input.wav:/audio.wav:ro" \
   l4-parakeet-rs:local transcribe --artifact /models/v2-fp16-sm89.pkl4 \
-  --input /audio.wav --warmup-iterations 0 --measured-trials 1
+  --input /audio.wav --warmup-iterations 1 --measured-trials 1
 
 docker run --rm --gpus all -p 127.0.0.1:8080:8080 \
   -v "$PWD/models:/models:ro" l4-parakeet-rs:local serve \
@@ -107,7 +108,24 @@ From another terminal:
 curl --fail http://127.0.0.1:8080/health
 curl --fail http://127.0.0.1:8080/v1/audio/transcriptions \
   -F 'file=@input.wav;type=audio/wav' -F response_format=json
+
+# Decoder-derived word/token times, not uniformly distributed clip spans:
+curl --fail http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F file=@input.wav -F response_format=verbose_json \
+  -F 'timestamp_granularities[]=word'
+
+# Explicit batching extension; results follow the order of repeated file fields:
+curl --fail http://127.0.0.1:8080/v1/audio/transcriptions/batch \
+  -F file=@first.wav -F file=@second.wav
 ```
+
+Native `transcribe-batch --artifact model.pkl4 --input first.wav second.wav`
+returns the same ordered results plus separate CUDA-stage and wall timings.
+Batches support up to 16 short clips, subject to a 1,008-row packed workspace
+limit; oversized batches are rejected rather than silently run serially.
+See [V2 capabilities and batching](docs/v2-features.md) for exact limits,
+timestamp semantics, examples, and validation results. These features require
+a build of this branch; they are not in the previously published GHCR image.
 
 The HTTP API implements a subset of OpenAI-compatible transcription requests,
 not a full Whisper replacement. There is no built-in authentication or TLS;
