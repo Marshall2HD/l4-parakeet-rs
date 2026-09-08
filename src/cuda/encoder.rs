@@ -148,6 +148,7 @@ pub fn benchmark_encoder_layer(
     let position_input = uploaded.stream.clone_htod(&position_host)?;
     let mut buffers = LayerBuffers {
         source: Some(uploaded.stream.clone_htod(&input_host)?),
+        bounds: None,
         state_a: uploaded.stream.alloc_zeros(padded_rows * MODEL_WIDTH)?,
         state_b: uploaded.stream.alloc_zeros(padded_rows * MODEL_WIDTH)?,
         normalized: uploaded.stream.alloc_zeros(padded_rows * MODEL_WIDTH)?,
@@ -433,6 +434,7 @@ impl QuantizedFfnWeights {
 
 pub(super) struct LayerBuffers {
     pub(super) source: Option<CudaSlice<f16>>,
+    pub(super) bounds: Option<CudaSlice<i32>>,
     pub(super) state_a: CudaSlice<f16>,
     pub(super) state_b: CudaSlice<f16>,
     pub(super) normalized: CudaSlice<f16>,
@@ -494,6 +496,9 @@ pub(super) fn run_layers(
     valid_rows: usize,
     padded_rows: usize,
 ) -> Result<(), Box<dyn Error>> {
+    if buffers.bounds.is_some() && padded_rows >= LARGE_LINEAR_ROWS {
+        return Err("packed batch must stay below the long-form GEMM policy".into());
+    }
     let active_elements = padded_rows
         .checked_mul(MODEL_WIDTH)
         .ok_or("encoder active element count overflow")?;
@@ -618,7 +623,7 @@ fn run_layer(
     padded_rows: usize,
 ) -> Result<(), Box<dyn Error>> {
     let use_large_linear = padded_rows >= LARGE_LINEAR_ROWS;
-    let use_long_attention = padded_rows >= 512;
+    let use_long_attention = padded_rows >= 512 && buffers.bounds.is_none();
     let sequence_linear = if use_large_linear {
         &kernels.linear_large
     } else {
@@ -901,6 +906,7 @@ fn run_layer(
             padded_rows,
             valid_rows,
             value_stride,
+            buffers.bounds.as_ref(),
         )?;
         let mut output = buffers.state_a.slice_mut(..);
         if use_packed_attention {
@@ -989,6 +995,7 @@ fn run_layer(
                 rows,
                 padded_rows,
                 valid_rows,
+                buffers.bounds.as_ref(),
             )?;
         }
         let mut output = buffers.state_a.slice_mut(..);
@@ -1997,6 +2004,7 @@ fn launch_attention_arena(
     padded_rows: usize,
     valid_rows: usize,
     value_stride: usize,
+    bounds: Option<&CudaSlice<i32>>,
 ) -> Result<(), Box<dyn Error>> {
     let rows_i32 = i32::try_from(rows)?;
     let padded_rows_i32 = i32::try_from(padded_rows)?;
@@ -2088,6 +2096,14 @@ fn launch_attention_arena(
         .arg(&valid_rows_i32)
         .arg(&attention_left)
         .arg(&attention_right);
+    let null_bounds = 0_u64;
+    if padded_rows < 512 || bounds.is_some() {
+        if let Some(bounds) = bounds {
+            builder.arg(bounds);
+        } else {
+            builder.arg(&null_bounds);
+        }
+    }
     if value_fp8.is_some() {
         builder.arg(&value_stride);
     }
@@ -2096,7 +2112,7 @@ fn launch_attention_arena(
     {
         builder.arg(key).arg(ks).arg(position).arg(ps);
     }
-    let config = if padded_rows >= 512 {
+    let config = if padded_rows >= 512 && bounds.is_none() {
         LaunchConfig {
             grid_dim: (u32::try_from(padded_rows.div_ceil(16))?, 8, 1),
             block_dim: (256, 1, 1),
@@ -2113,6 +2129,7 @@ fn launch_attention_arena(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_glu_arena(
     stream: &CudaStream,
     function: &CudaFunction,
@@ -2121,6 +2138,7 @@ fn launch_glu_arena(
     rows: usize,
     padded_rows: usize,
     valid_rows: usize,
+    bounds: Option<&CudaSlice<i32>>,
 ) -> Result<(), Box<dyn Error>> {
     let threads = 256_u32;
     let rows_i32 = i32::try_from(rows)?;
@@ -2133,6 +2151,12 @@ fn launch_glu_arena(
         .arg(&rows_i32)
         .arg(&padded_rows_i32)
         .arg(&valid_rows_i32);
+    let null_bounds = 0_u64;
+    if let Some(bounds) = bounds {
+        builder.arg(bounds);
+    } else {
+        builder.arg(&null_bounds);
+    }
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (

@@ -6,6 +6,7 @@ pub mod exl3;
 pub mod frontend;
 pub mod packing;
 pub mod server;
+pub mod transcription;
 pub mod weights;
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]

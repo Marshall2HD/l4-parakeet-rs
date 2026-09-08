@@ -155,6 +155,22 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         device: usize,
     },
+    /// Transcribe an ordered short-clip batch with a packed GPU encoder.
+    TranscribeBatch {
+        #[arg(long)]
+        artifact: PathBuf,
+        #[arg(long, required = true, num_args = 1..)]
+        input: Vec<PathBuf>,
+        #[arg(long, default_value_t = 1)]
+        warmup_iterations: usize,
+        #[arg(long, default_value_t = 1)]
+        measured_trials: usize,
+        /// Compare every trial's token IDs with individual inference, failing on mismatch.
+        #[arg(long)]
+        verify_single: bool,
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+    },
     /// Serve the persistent L4 pipeline through OpenAI-compatible Whisper endpoints.
     Serve {
         #[arg(long)]
@@ -428,6 +444,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             measured_trials,
             device,
         )?,
+        Command::TranscribeBatch {
+            artifact,
+            input,
+            warmup_iterations,
+            measured_trials,
+            verify_single,
+            device,
+        } => {
+            transcribe_batch(
+                &artifact,
+                &input,
+                warmup_iterations,
+                measured_trials,
+                verify_single,
+                device,
+            )?;
+        }
         Command::Serve {
             artifact,
             host,
@@ -841,6 +874,84 @@ fn transcribe(
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn transcribe_batch(
+    artifact: &std::path::Path,
+    paths: &[PathBuf],
+    warmups: usize,
+    trials: usize,
+    verify: bool,
+    device: usize,
+) -> Result<(), Box<dyn Error>> {
+    if trials == 0 {
+        return Err("measured trials must be nonzero".into());
+    }
+    let audio = paths
+        .iter()
+        .map(|path| parakeet_l4::audio::read_pcm16_mono(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if audio.iter().any(|item| item.sample_rate != 16_000) {
+        return Err("batch requires 16 kHz mono PCM16 WAV".into());
+    }
+    let inputs = audio
+        .iter()
+        .map(|item| item.samples.as_slice())
+        .collect::<Vec<_>>();
+    if inputs.len() != 1 {
+        parakeet_l4::transcription::BatchLayout::new(
+            &inputs.iter().map(|x| x.len()).collect::<Vec<_>>(),
+        )?;
+    }
+    let mut engine = parakeet_l4::cuda::PipelineEngine::load(
+        device,
+        artifact,
+        inputs.iter().map(|x| x.len()).max().unwrap(),
+    )?;
+    let singles = if verify {
+        inputs
+            .iter()
+            .map(|samples| engine.transcribe(samples))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    for _ in 0..warmups {
+        engine.transcribe_batch(&inputs)?;
+    }
+    let mut reports = Vec::with_capacity(trials);
+    for _ in 0..trials {
+        let report = engine.transcribe_batch(&inputs)?;
+        for (index, (batch, single)) in report.results.iter().zip(&singles).enumerate() {
+            if batch.token_ids != single.token_ids {
+                return Err(format!("batch token parity failed for input {index}").into());
+            }
+        }
+        reports.push(report);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &serde_json::json!({"single_token_parity": verify.then_some(true), "trials": reports})
+        )?
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "cuda", target_os = "linux")))]
+fn transcribe_batch(
+    _artifact: &std::path::Path,
+    _paths: &[PathBuf],
+    _warmups: usize,
+    _trials: usize,
+    _verify: bool,
+    _device: usize,
+) -> Result<(), Box<dyn Error>> {
+    Err(
+        "CUDA support requires x86_64 Linux and `cargo build --locked --release --features cuda`"
+            .into(),
+    )
 }
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]

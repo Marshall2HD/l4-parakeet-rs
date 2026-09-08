@@ -311,7 +311,8 @@ void pk_sm89_glu_masked(
     __half* __restrict__ output,
     int rows,
     int padded_rows,
-    int valid_rows) {
+    int valid_rows,
+    const int32_t* __restrict__ bounds) {
     const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int total = padded_rows * kModelWidth;
     if (index >= total) {
@@ -319,7 +320,7 @@ void pk_sm89_glu_masked(
     }
     const int row = index / kModelWidth;
     const int feature = index - row * kModelWidth;
-    if (row >= rows || row >= valid_rows) {
+    if (row >= rows || row >= valid_rows || (bounds && row >= bounds[2 * row + 1])) {
         output[index] = __float2half_rn(0.0f);
         return;
     }
@@ -1475,7 +1476,8 @@ void pk_sm89_local_relpos_attention(
     int padded_rows,
     int valid_rows,
     int attention_left,
-    int attention_right) {
+    int attention_right,
+    const int32_t* __restrict__ bounds) {
     const int query_row = static_cast<int>(blockIdx.x);
     const int head = static_cast<int>(blockIdx.y);
     const int thread = static_cast<int>(threadIdx.x);
@@ -1485,7 +1487,9 @@ void pk_sm89_local_relpos_attention(
     if (query_row >= padded_rows || head >= kHeads) {
         return;
     }
-    if (query_row >= rows || query_row >= valid_rows) {
+    const int first_valid = bounds ? bounds[2 * query_row] : 0;
+    const int end_valid = bounds ? bounds[2 * query_row + 1] : valid_rows;
+    if (query_row >= rows || query_row >= end_valid) {
         for (int dimension = lane; dimension < kHeadWidth; dimension += 32) {
             output[query_row * kModelWidth + head * kHeadWidth + dimension] =
                 __float2half_rn(0.0f);
@@ -1493,8 +1497,8 @@ void pk_sm89_local_relpos_attention(
         return;
     }
 
-    const int first_key = max(0, query_row - attention_left);
-    const int last_key = min(valid_rows - 1, query_row + attention_right);
+    const int first_key = max(first_valid, query_row - attention_left);
+    const int last_key = min(end_valid - 1, query_row + attention_right);
     const int key_count = last_key - first_key + 1;
     __shared__ float scores[kMaxAttention];
 

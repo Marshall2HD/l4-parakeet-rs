@@ -425,6 +425,8 @@ __device__ __forceinline__ void tdt_persistent_fp16(
             control[kSelectedDuration] = duration;
             if (token != kBlank) {
                 output_tokens[*output_count] = token;
+                output_tokens[frames * kMaxSymbols + *output_count] = current_frame;
+                output_tokens[2 * frames * kMaxSymbols + *output_count] = duration;
                 *output_count += 1;
             }
         }
@@ -807,6 +809,8 @@ __device__ __forceinline__ void tdt_persistent_fp8(
             control[kSelectedDuration] = duration;
             if (token != kBlank) {
                 output_tokens[*output_count] = token;
+                output_tokens[frames * kMaxSymbols + *output_count] = current_frame;
+                output_tokens[2 * frames * kMaxSymbols + *output_count] = duration;
                 *output_count += 1;
             }
         }
