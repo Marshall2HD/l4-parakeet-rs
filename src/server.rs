@@ -1,5 +1,6 @@
 #![cfg_attr(not(all(feature = "cuda", target_os = "linux")), allow(dead_code))]
 
+use crate::transcription::{BatchLayout, TokenTimestamp, WordTimestamp};
 use serde_json::{Value, json};
 use std::error::Error;
 
@@ -153,6 +154,22 @@ fn parse_transcription_form<'a>(
         ));
     }
 
+    if optional_text_field(&parts, "language")?
+        .is_some_and(|language| !matches!(language.as_str(), "" | "en" | "en-US"))
+    {
+        return Err(ApiError::invalid(
+            "this V2 checkpoint supports English only",
+            Some("language"),
+            "unsupported_language",
+        ));
+    }
+    if optional_text_field(&parts, "stream")?
+        .is_some_and(|value| value != "false" && value != "0" && !value.is_empty())
+    {
+        return Err(ApiError::not_implemented(
+            "this backend performs offline inference, not streaming",
+        ));
+    }
     let format = match optional_text_field(&parts, "response_format")?.as_deref() {
         None | Some("") | Some("json") => ResponseFormat::Json,
         Some("text") => ResponseFormat::Text,
@@ -353,9 +370,30 @@ fn part_name(headers: &[u8]) -> Result<String, ApiError> {
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     (!needle.is_empty() && haystack.len() >= needle.len())
         .then(|| {
-            haystack
-                .windows(needle.len())
-                .position(|window| window == needle)
+            let starts = &haystack[..haystack.len() - needle.len() + 1];
+            let mut chunks = starts.chunks_exact(16);
+            let first = u128::from_le_bytes([needle[0]; 16]);
+            const ONES: u128 = u128::from_le_bytes([0x01; 16]);
+            const HIGHS: u128 = u128::from_le_bytes([0x80; 16]);
+            for (chunk_index, chunk) in chunks.by_ref().enumerate() {
+                let word = u128::from_le_bytes(chunk.try_into().unwrap()) ^ first;
+                // Every zero byte sets its high bit. Borrow propagation can add
+                // candidates, which the full delimiter comparison rejects.
+                let mut candidates = word.wrapping_sub(ONES) & !word & HIGHS;
+                while candidates != 0 {
+                    let offset = chunk_index * 16 + candidates.trailing_zeros() as usize / 8;
+                    if haystack[offset..].starts_with(needle) {
+                        return Some(offset);
+                    }
+                    candidates &= candidates - 1;
+                }
+            }
+            let remainder = chunks.remainder();
+            let remainder_start = starts.len() - remainder.len();
+            remainder.iter().enumerate().find_map(|(index, &byte)| {
+                let offset = remainder_start + index;
+                (byte == needle[0] && haystack[offset..].starts_with(needle)).then_some(offset)
+            })
         })
         .flatten()
 }
@@ -401,6 +439,8 @@ fn format_transcription(
     duration: f64,
     format: ResponseFormat,
     include_words: bool,
+    words: &[WordTimestamp],
+    tokens: &[TokenTimestamp],
 ) -> ApiResponse {
     match format {
         ResponseFormat::Json => ApiResponse::json(json!({ "text": text })),
@@ -410,58 +450,151 @@ fn format_transcription(
             body: text.as_bytes().to_vec(),
         },
         ResponseFormat::VerboseJson => {
-            let words = text.split_whitespace().collect::<Vec<_>>();
             let mut value = json!({
                 "task": "transcribe",
                 "language": "en",
                 "duration": duration,
                 "text": text,
-                "segments": [{
-                    "id": 0,
-                    "start": 0.0,
-                    "end": duration,
-                    "text": text,
-                }],
+                "timestamp_source": "tdt_emission_duration",
+                "tokens": tokens,
+                "segments": words.iter().enumerate().map(|(id, word)| json!({
+                    "id": id, "start": word.start, "end": word.end, "text": word.word,
+                })).collect::<Vec<_>>(),
             });
             if include_words {
-                let count = words.len() as f64;
-                value["words"] = Value::Array(
-                    words
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, word)| {
-                            json!({
-                                "word": word,
-                                "start": duration * index as f64 / count,
-                                "end": duration * (index + 1) as f64 / count,
-                            })
-                        })
-                        .collect(),
-                );
+                value["words"] = serde_json::to_value(words).expect("finite word offsets");
             }
             ApiResponse::json(value)
         }
         ResponseFormat::Srt => ApiResponse {
             status: 200,
             content_type: "text/plain; charset=utf-8",
-            body: format!(
-                "1\n{} --> {}\n{text}\n",
-                subtitle_timestamp(0.0, ','),
-                subtitle_timestamp(duration, ',')
-            )
-            .into_bytes(),
+            body: subtitle_cues(words)
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    format!(
+                        "{}\n{} --> {}\n{}\n\n",
+                        index + 1,
+                        subtitle_timestamp(word.start, ','),
+                        subtitle_timestamp(word.end, ','),
+                        word.word,
+                    )
+                })
+                .collect::<String>()
+                .into_bytes(),
         },
         ResponseFormat::Vtt => ApiResponse {
             status: 200,
             content_type: "text/vtt; charset=utf-8",
-            body: format!(
-                "WEBVTT\n\n{} --> {}\n{text}\n",
-                subtitle_timestamp(0.0, '.'),
-                subtitle_timestamp(duration, '.')
-            )
-            .into_bytes(),
+            body: ("WEBVTT\n\n".to_owned()
+                + &subtitle_cues(words)
+                    .iter()
+                    .map(|word| {
+                        format!(
+                            "{} --> {}\n{}\n\n",
+                            subtitle_timestamp(word.start, '.'),
+                            subtitle_timestamp(word.end, '.'),
+                            word.word,
+                        )
+                    })
+                    .collect::<String>())
+                .into_bytes(),
         },
     }
+}
+
+// TDT permits zero-duration words. Merge these into adjacent display cues
+// rather than inventing durations or emitting invalid zero-length WebVTT cues.
+// The JSON word/token offsets remain the unmodified model predictions.
+fn subtitle_cues(words: &[WordTimestamp]) -> Vec<WordTimestamp> {
+    let mut cues: Vec<WordTimestamp> = Vec::new();
+    for word in words {
+        if let Some(previous) = cues.last_mut()
+            && (previous.end == previous.start || word.end == word.start)
+        {
+            previous.word.push(' ');
+            previous.word.push_str(&word.word);
+            previous.end = word.end;
+        } else {
+            cues.push(word.clone());
+        }
+    }
+    cues.retain(|cue| cue.end > cue.start);
+    cues
+}
+
+fn parse_batch_audio(
+    content_type: &str,
+    body: &[u8],
+    max_samples: usize,
+) -> Result<Vec<crate::audio::Audio>, ApiError> {
+    let boundary = multipart_boundary(content_type)?;
+    let parts = parse_multipart(body, &boundary)?;
+    if parts.iter().any(|part| part.name != "file") {
+        return Err(ApiError::invalid(
+            "batch endpoint accepts only repeated 'file' fields and returns JSON",
+            None,
+            "unsupported_field",
+        ));
+    }
+    if parts.is_empty() || parts.len() > crate::transcription::MAX_BATCH_ITEMS {
+        return Err(ApiError::invalid(
+            "batch must contain between 1 and 16 files",
+            Some("file"),
+            "invalid_batch",
+        ));
+    }
+    let mut counts = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let (pcm, sample_rate) = crate::audio::pcm16_mono_data(part.data).map_err(|error| {
+            ApiError::invalid(
+                format!("file {index}: {error}"),
+                Some("file"),
+                "invalid_audio",
+            )
+        })?;
+        if sample_rate != 16_000 || pcm.is_empty() || pcm.len() / 2 > max_samples {
+            return Err(ApiError::invalid(
+                format!("file {index}: expected nonempty 16 kHz audio within configured capacity"),
+                Some("file"),
+                "invalid_audio",
+            ));
+        }
+        counts.push(pcm.len() / 2);
+    }
+    if counts.len() > 1 {
+        BatchLayout::new(&counts)
+            .map_err(|error| ApiError::invalid(error, Some("file"), "invalid_batch"))?;
+    }
+    parts
+        .iter()
+        .map(|part| {
+            crate::audio::decode_pcm16_mono(part.data).map_err(|error| {
+                ApiError::invalid(error.to_string(), Some("file"), "invalid_audio")
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn transcribe_batch_request(
+    engine: &mut crate::cuda::PipelineEngine,
+    content_type: &str,
+    body: &[u8],
+) -> Result<ApiResponse, ApiError> {
+    let audio = parse_batch_audio(content_type, body, engine.max_samples())?;
+    let inputs = audio
+        .iter()
+        .map(|item| item.samples.as_slice())
+        .collect::<Vec<_>>();
+    let batch = engine.transcribe_batch(&inputs).map_err(|error| {
+        eprintln!("parakeet-l4: batch inference failed: {error}");
+        ApiError::internal()
+    })?;
+    Ok(ApiResponse::json(
+        serde_json::to_value(batch).expect("finite batch result"),
+    ))
 }
 
 fn subtitle_timestamp(seconds: f64, separator: char) -> String {
@@ -484,6 +617,7 @@ pub fn serve(
     max_audio_seconds: usize,
     max_upload_bytes: usize,
 ) -> Result<(), Box<dyn Error>> {
+    use crate::audio::pcm16_mono_data;
     use crate::cuda::PipelineEngine;
     use std::io::Read;
     use tiny_http::{Header, Method, Response, Server, StatusCode};
@@ -500,6 +634,7 @@ pub fn serve(
         .map_err(|error| format!("failed to bind HTTP server at {address}: {error}"))?;
     eprintln!("parakeet-l4: listening on http://{address} ({MODEL_ID}, max {max_audio_seconds}s)");
 
+    let mut body = Vec::new();
     let mut sequence = 0_u64;
     for mut request in server.incoming_requests() {
         sequence = sequence.wrapping_add(1);
@@ -529,7 +664,12 @@ pub fn serve(
                     "audio translation is not supported by this transcription-only backend",
                 ))
             }
-            (Method::Post, "/v1/audio/transcriptions" | "/openai/v1/audio/transcriptions") => {
+            (
+                Method::Post,
+                "/v1/audio/transcriptions"
+                | "/openai/v1/audio/transcriptions"
+                | "/v1/audio/transcriptions/batch",
+            ) => {
                 let content_type = request
                     .headers()
                     .iter()
@@ -542,9 +682,8 @@ pub fn serve(
                 {
                     Err(ApiError::payload_too_large(max_upload_bytes))
                 } else {
-                    let mut body = Vec::with_capacity(
-                        request.body_length().unwrap_or(0).min(max_upload_bytes),
-                    );
+                    body.clear();
+                    body.reserve(request.body_length().unwrap_or(0).min(max_upload_bytes));
                     let read_result = request
                         .as_reader()
                         .take(u64::try_from(max_upload_bytes)? + 1)
@@ -558,9 +697,12 @@ pub fn serve(
                         Ok(_) if body.len() > max_upload_bytes => {
                             Err(ApiError::payload_too_large(max_upload_bytes))
                         }
+                        Ok(_) if path.ends_with("/batch") => {
+                            transcribe_batch_request(&mut engine, &content_type, &body)
+                        }
                         Ok(_) => match parse_transcription_form(&content_type, &body) {
                             Err(error) => Err(error),
-                            Ok(form) => match crate::audio::decode_pcm16_mono(form.audio) {
+                            Ok(form) => match pcm16_mono_data(form.audio) {
                                 Err(error) => Err(ApiError::invalid(
                                     format!(
                                         "could not decode audio; only 16 kHz mono PCM16 WAV is supported: {error}"
@@ -568,15 +710,16 @@ pub fn serve(
                                     Some("file"),
                                     "invalid_audio",
                                 )),
-                                Ok(audio) if audio.sample_rate != 16_000 => Err(ApiError::invalid(
-                                    format!(
-                                        "input sample rate is {}, expected 16000",
-                                        audio.sample_rate
-                                    ),
-                                    Some("file"),
-                                    "unsupported_sample_rate",
-                                )),
-                                Ok(audio) if audio.samples.len() > engine.max_samples() => {
+                                Ok((_, sample_rate)) if sample_rate != 16_000 => {
+                                    Err(ApiError::invalid(
+                                        format!(
+                                            "input sample rate is {sample_rate}, expected 16000"
+                                        ),
+                                        Some("file"),
+                                        "unsupported_sample_rate",
+                                    ))
+                                }
+                                Ok((pcm, _)) if pcm.len() / 2 > engine.max_samples() => {
                                     Err(ApiError::invalid(
                                         format!(
                                             "audio duration exceeds the configured {max_audio_seconds}-second maximum"
@@ -585,7 +728,7 @@ pub fn serve(
                                         "audio_too_long",
                                     ))
                                 }
-                                Ok(audio) => match engine.transcribe(&audio.samples) {
+                                Ok((pcm, _)) => match engine.transcribe_pcm16(pcm) {
                                     Ok(transcription) => {
                                         eprintln!(
                                             "parakeet-l4: {request_id} transcribed {:.3}s in {:.3} ms",
@@ -597,6 +740,8 @@ pub fn serve(
                                             transcription.audio_seconds,
                                             form.format,
                                             form.include_words,
+                                            &transcription.words,
+                                            &transcription.tokens,
                                         ))
                                     }
                                     Err(error) => {
@@ -677,6 +822,68 @@ mod tests {
     }
 
     #[test]
+    fn finds_binary_delimiters_across_scan_chunks() {
+        let needle = b"\r\n--parakeet-boundary";
+        for offset in 0..192 {
+            let mut body = vec![b'\r'; offset];
+            body.extend_from_slice(needle);
+            body.extend_from_slice(needle);
+            assert_eq!(find_bytes(&body, needle), Some(offset));
+            body.truncate(offset + needle.len() - 1);
+            assert_eq!(find_bytes(&body, needle), None);
+        }
+        assert_eq!(find_bytes(b"", needle), None);
+        assert_eq!(find_bytes(needle, b""), None);
+        assert_eq!(find_bytes(b"abc\0\xff", b"\0\xff"), Some(3));
+        assert_eq!(find_bytes(b"abc", b"c"), Some(2));
+    }
+
+    #[test]
+    fn delimiter_mask_matches_scalar_search_for_all_byte_pairs() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let mut body = [0; 48];
+                for pair in body.chunks_exact_mut(2) {
+                    pair.copy_from_slice(&[first, second]);
+                }
+                for needle in [b"\r\n".as_slice(), b"\0\x01", b"\xff\xfe"] {
+                    assert_eq!(
+                        find_bytes(&body, needle),
+                        body.windows(needle.len())
+                            .position(|window| window == needle)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delimiter_mask_matches_scalar_search_at_unaligned_edges() {
+        let mut bytes = [0; 512];
+        let mut state = 1u32;
+        for byte in &mut bytes {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        for alignment in 0..16 {
+            for length in 0..256 {
+                let body = &bytes[alignment..alignment + length];
+                for needle_len in 0..=76 {
+                    let start = length / 2;
+                    let needle = &bytes[alignment + start..alignment + start + needle_len];
+                    let expected = if needle.is_empty() {
+                        None
+                    } else {
+                        body.windows(needle.len())
+                            .position(|window| window == needle)
+                    };
+                    assert_eq!(find_bytes(body, needle), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejects_missing_file_and_unknown_format() {
         let (content_type, body) = multipart(&[("model", b"whisper-1")]);
         let error = parse_transcription_form(&content_type, &body).unwrap_err();
@@ -691,28 +898,80 @@ mod tests {
 
     #[test]
     fn formats_all_whisper_response_shapes() {
-        let json = format_transcription("hello world", 2.5, ResponseFormat::Json, false);
+        let words = [
+            WordTimestamp {
+                word: "hello".into(),
+                start: 0.32,
+                end: 0.64,
+            },
+            WordTimestamp {
+                word: "world".into(),
+                start: 1.28,
+                end: 1.52,
+            },
+        ];
+        let json =
+            format_transcription("hello world", 2.5, ResponseFormat::Json, false, &words, &[]);
         assert_eq!(
             serde_json::from_slice::<Value>(&json.body).unwrap()["text"],
             "hello world"
         );
 
-        let verbose = format_transcription("hello world", 2.5, ResponseFormat::VerboseJson, true);
+        let verbose = format_transcription(
+            "hello world",
+            2.5,
+            ResponseFormat::VerboseJson,
+            true,
+            &words,
+            &[],
+        );
         let verbose = serde_json::from_slice::<Value>(&verbose.body).unwrap();
         assert_eq!(verbose["language"], "en");
-        assert_eq!(verbose["segments"][0]["end"], 2.5);
+        assert_eq!(verbose["segments"][0]["end"], 0.64);
+        assert_eq!(verbose["words"][1]["start"], 1.28);
         assert_eq!(verbose["words"].as_array().unwrap().len(), 2);
 
-        let text = format_transcription("hello", 2.5, ResponseFormat::Text, false);
+        let text = format_transcription("hello", 2.5, ResponseFormat::Text, false, &words, &[]);
         assert_eq!(text.body, b"hello");
-        let srt = format_transcription("hello", 2.5, ResponseFormat::Srt, false);
+        let srt = format_transcription("hello world", 2.5, ResponseFormat::Srt, false, &words, &[]);
         assert!(
             String::from_utf8(srt.body)
                 .unwrap()
-                .contains("00:00:02,500")
+                .contains("00:00:01,280 --> 00:00:01,520\nworld")
         );
-        let vtt = format_transcription("hello", 2.5, ResponseFormat::Vtt, false);
+        let vtt = format_transcription("hello world", 2.5, ResponseFormat::Vtt, false, &words, &[]);
         assert!(String::from_utf8(vtt.body).unwrap().starts_with("WEBVTT"));
+        assert!(
+            format_transcription("", 2.5, ResponseFormat::Srt, false, &[], &[])
+                .body
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subtitle_zero_durations_are_merged_without_fabricating_times() {
+        let words = [
+            WordTimestamp {
+                word: "I".into(),
+                start: 0.0,
+                end: 0.0,
+            },
+            WordTimestamp {
+                word: "am".into(),
+                start: 0.0,
+                end: 0.16,
+            },
+            WordTimestamp {
+                word: "here.".into(),
+                start: 0.16,
+                end: 0.16,
+            },
+        ];
+        let cues = subtitle_cues(&words);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].word, "I am here.");
+        assert_eq!((cues[0].start, cues[0].end), (0.0, 0.16));
+        assert!(subtitle_cues(&words[..1]).is_empty());
     }
 
     #[test]

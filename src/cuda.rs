@@ -24,7 +24,10 @@ mod subsampling;
 pub use decoder::{DecoderBenchmarkReport, benchmark_decoder};
 pub use encoder::{EncoderLayerBenchmarkReport, benchmark_encoder_layer};
 pub use frontend::{GpuFrontendReport, benchmark_frontend};
-pub use pipeline::{PipelineBenchmarkReport, PipelineEngine, benchmark_pipeline};
+pub use pipeline::{
+    BatchTranscription, PipelineBenchmarkReport, PipelineEngine, PipelineTranscription,
+    benchmark_pipeline,
+};
 pub use q4k_benchmark::{Q4KBenchmarkReport, benchmark_q4_k_linear};
 pub use quant_benchmark::{QuantizedBenchmarkReport, benchmark_quantized_linear};
 pub use subsampling::{SubsamplingBenchmarkReport, benchmark_subsampling};

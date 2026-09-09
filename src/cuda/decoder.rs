@@ -95,7 +95,10 @@ pub fn benchmark_decoder(
     let mut encoder_projection = uploaded
         .stream
         .alloc_zeros::<f16>(padded_frames * JOINT_WIDTH)?;
-    let mut output_tokens = uploaded.stream.alloc_zeros::<i32>(frames * MAX_SYMBOLS)?;
+    // Three planes: token IDs, emission frames, and predicted TDT durations.
+    let mut output_tokens = uploaded
+        .stream
+        .alloc_zeros::<i32>(3 * frames * MAX_SYMBOLS)?;
     let mut output_count = uploaded.stream.alloc_zeros::<i32>(1)?;
     let mut decoder_workspace = uploaded
         .stream

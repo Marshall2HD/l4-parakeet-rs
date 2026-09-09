@@ -1,6 +1,9 @@
 use super::{SM89_CUBIN, UploadedAot, decoder, encoder, frontend, subsampling, upload_aot};
 use crate::artifact::{AotArtifactIndex, AotStorage};
 use crate::config::{FeatureExtractorConfig, ModelProfile};
+use crate::transcription::{
+    BatchLayout, MAX_BATCH_ROWS, TokenTimestamp, WordTimestamp, word_timestamps,
+};
 use cudarc::cufft::{CudaFft, result as cufft_result, sys as cufft_sys};
 use cudarc::driver::{CudaFunction, CudaSlice, sys};
 use cudarc::nvrtc::Ptx;
@@ -10,6 +13,7 @@ use std::error::Error;
 use std::mem::size_of;
 use std::path::Path;
 
+const PCM16_STAGING_BYTES: usize = 16 * 1024 * 1024;
 const ENCODER_LAYERS: usize = 24;
 // Quantizing the final FF1 expansion exceeded the dev-other quality gate.
 const FP8_FF1_LAYERS: usize = ENCODER_LAYERS - 1;
@@ -42,6 +46,8 @@ pub struct PipelineBenchmarkReport {
     pub realtime_factor: f64,
     pub token_count: usize,
     pub token_ids: Vec<i32>,
+    pub tokens: Vec<TokenTimestamp>,
+    pub words: Vec<WordTimestamp>,
     pub transcript: String,
     pub reference_token_count: usize,
     pub exact_token_match: Option<bool>,
@@ -51,11 +57,27 @@ pub struct PipelineBenchmarkReport {
 pub struct PipelineTranscription {
     pub text: String,
     pub token_ids: Vec<i32>,
+    pub tokens: Vec<TokenTimestamp>,
+    pub words: Vec<WordTimestamp>,
     pub audio_seconds: f64,
     pub inference_latency_ms: f64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct BatchTranscription {
+    pub results: Vec<PipelineTranscription>,
+    pub execution: &'static str,
+    pub packed_encoder_rows: usize,
+    pub encoder_latency_ms: f64,
+    /// Sum of CUDA-event frontend, encoder, and decoder intervals. Upload,
+    /// readback, and allocations are excluded. Each result shares this value.
+    pub cuda_stage_ms: f64,
+    pub wall_latency_ms: f64,
+    pub model_and_workspace_bytes: u64,
+}
+
 struct PipelineKernels {
+    pcm16_to_f32: CudaFunction,
     frame_window: CudaFunction,
     mel_log: CudaFunction,
     normalize: CudaFunction,
@@ -73,6 +95,8 @@ struct PipelineKernels {
 }
 
 struct PipelineWorkspace {
+    // Raw s16le bytes; the conversion kernel reads aligned int16_t values.
+    pcm16: CudaSlice<u8>,
     samples: CudaSlice<f32>,
     framed: CudaSlice<f32>,
     spectrum: CudaSlice<cufft_sys::float2>,
@@ -114,6 +138,7 @@ pub struct PipelineEngine {
     ff1_fp8: encoder::QuantizedFfnWeights,
     ff2_int4: encoder::QuantizedFfnWeights,
     workspace: PipelineWorkspace,
+    batch_staging: Option<CudaSlice<f16>>,
     max_samples: usize,
 }
 
@@ -164,7 +189,7 @@ impl PipelineEngine {
         let max_mel_frames = max_samples / config.hop_length + 1;
         let max_encoder_frames = subsampling::subsample_len(max_mel_frames);
         let max_valid_encoder_frames = subsampling::subsample_len(max_samples / config.hop_length);
-        let max_padded_encoder_frames = max_encoder_frames.next_multiple_of(16);
+        let max_padded_encoder_frames = max_encoder_frames.next_multiple_of(16).max(MAX_BATCH_ROWS);
         let fft_batch_frames = max_mel_frames.min(frontend::MAX_CHUNK_FRAMES);
         let uploaded = upload_aot(device, artifact_path)?;
         let (major, minor) = uploaded.context.compute_capability()?;
@@ -192,6 +217,7 @@ impl PipelineEngine {
             .load_module(Ptx::from_binary(SM89_CUBIN.to_vec()))?;
         let linear = linear_module.load_function("pk_sm89_fp16_linear_epilogue")?;
         let kernels = PipelineKernels {
+            pcm16_to_f32: frontend_module.load_function("pk_sm89_pcm16_to_f32")?,
             frame_window: frontend_module.load_function("pk_sm89_frame_window")?,
             mel_log: frontend_module.load_function("pk_sm89_mel_log_sparse")?,
             normalize: frontend_module.load_function("pk_sm89_normalize_mel")?,
@@ -248,6 +274,7 @@ impl PipelineEngine {
                 pack_key: encoder_module.load_function("pk_sm89_pack_key_int4")?,
                 attention_output_fp8: encoder_module
                     .load_function("pk_sm89_attention_output_fp8")?,
+                qkv_fp8: encoder_module.load_function("pk_sm89_qkv_fp8")?,
                 linear: linear.clone(),
                 linear_large: linear_module.load_function("pk_sm89_fp16_linear_epilogue_m64")?,
                 qkv: linear_module.load_function("pk_sm89_fp16_qkv")?,
@@ -278,6 +305,9 @@ impl PipelineEngine {
         let max_first_frames = 2 * max_second_frames + 1;
         let padded_tile_frames = subsampling::TILE_OUTPUT_FRAMES.next_multiple_of(16);
         let mut workspace = PipelineWorkspace {
+            pcm16: uploaded
+                .stream
+                .alloc_zeros((max_samples * 2).min(PCM16_STAGING_BYTES))?,
             samples: uploaded.stream.alloc_zeros(max_samples)?,
             framed: uploaded
                 .stream
@@ -315,6 +345,7 @@ impl PipelineEngine {
                 .alloc_zeros(padded_tile_frames * encoder::MODEL_WIDTH)?,
             encoder: encoder::LayerBuffers {
                 source: None,
+                bounds: None,
                 state_a: uploaded
                     .stream
                     .alloc_zeros(max_padded_encoder_frames * encoder::MODEL_WIDTH)?,
@@ -345,7 +376,7 @@ impl PipelineEngine {
                 .alloc_zeros(decoder::DECODER_CONTROL_VALUES)?,
             output_tokens: uploaded
                 .stream
-                .alloc_zeros((max_valid_encoder_frames * decoder::MAX_SYMBOLS).max(1))?,
+                .alloc_zeros((3 * max_valid_encoder_frames * decoder::MAX_SYMBOLS).max(1))?,
             output_count: uploaded.stream.alloc_zeros(1)?,
         };
         let encoder_weights = (0..ENCODER_LAYERS)
@@ -386,6 +417,7 @@ impl PipelineEngine {
             ff1_fp8,
             ff2_int4,
             workspace,
+            batch_staging: None,
             max_samples,
         })
     }
@@ -396,38 +428,241 @@ impl PipelineEngine {
 
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<PipelineTranscription, Box<dyn Error>> {
         self.prepare_samples(samples)?;
+        self.transcribe_prepared(samples.len())
+    }
+
+    /// Transcribe a validated mono s16le payload without a host f32 conversion.
+    pub fn transcribe_pcm16(
+        &mut self,
+        pcm: &[u8],
+    ) -> Result<PipelineTranscription, Box<dyn Error>> {
+        if pcm.len() % 2 != 0 {
+            return Err("PCM16 payload must contain whole samples".into());
+        }
+        let sample_count = pcm.len() / 2;
+        self.validate_sample_count(sample_count)?;
+        for (chunk, bytes) in pcm.chunks(self.workspace.pcm16.len()).enumerate() {
+            self.uploaded
+                .stream
+                .memcpy_htod(bytes, &mut self.workspace.pcm16)?;
+            let start = chunk * self.workspace.pcm16.len() / 2;
+            frontend::convert_pcm16(
+                &self.uploaded.stream,
+                &self.kernels.pcm16_to_f32,
+                &self.workspace.pcm16,
+                &mut self
+                    .workspace
+                    .samples
+                    .slice_mut(start..start + bytes.len() / 2),
+            )?;
+        }
+        self.transcribe_prepared(sample_count)
+    }
+
+    fn transcribe_prepared(
+        &mut self,
+        sample_count: usize,
+    ) -> Result<PipelineTranscription, Box<dyn Error>> {
         let started = self
             .uploaded
             .stream
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
-        self.run_prepared(samples.len())?;
+        self.run_prepared(sample_count)?;
         let ended = self
             .uploaded
             .stream
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let inference_latency_ms = f64::from(started.elapsed_ms(&ended)?);
+        self.read_transcription(sample_count, inference_latency_ms)
+    }
+
+    fn read_transcription(
+        &self,
+        sample_count: usize,
+        inference_latency_ms: f64,
+    ) -> Result<PipelineTranscription, Box<dyn Error>> {
         let token_ids = self.read_tokens()?;
         let text = decoder::decode_tokens(&self.vocabulary, &token_ids)?;
+        let frames = subsampling::subsample_len(sample_count / self.config.hop_length);
+        let stride = frames * decoder::MAX_SYMBOLS;
+        let starts = self.uploaded.stream.clone_dtoh(
+            &self
+                .workspace
+                .output_tokens
+                .slice(stride..stride + token_ids.len()),
+        )?;
+        let durations = self.uploaded.stream.clone_dtoh(
+            &self
+                .workspace
+                .output_tokens
+                .slice(2 * stride..2 * stride + token_ids.len()),
+        )?;
+        let audio_seconds = sample_count as f64 / self.config.sampling_rate as f64;
+        let tokens = token_ids
+            .iter()
+            .zip(starts)
+            .zip(durations)
+            .map(|((&id, start_frame), duration_frames)| TokenTimestamp {
+                id,
+                piece: self.vocabulary[id as usize].clone(),
+                start_frame,
+                duration_frames,
+                start: (f64::from(start_frame) * 0.08).min(audio_seconds),
+                end: (f64::from(start_frame + duration_frames) * 0.08).min(audio_seconds),
+            })
+            .collect::<Vec<_>>();
+        let words = word_timestamps(&tokens);
         Ok(PipelineTranscription {
             text,
             token_ids,
-            audio_seconds: samples.len() as f64 / self.config.sampling_rate as f64,
+            tokens,
+            words,
+            audio_seconds,
             inference_latency_ms,
         })
     }
 
-    fn prepare_samples(&mut self, samples: &[f32]) -> Result<(), Box<dyn Error>> {
-        if samples.is_empty() {
+    /// Packed GPU encoder batching, not a serial loop over `transcribe`.
+    /// Frontend normalization stays per utterance; the cooperative decoder is
+    /// serial. Input order is preserved. Oversized batches fail before upload.
+    pub fn transcribe_batch(
+        &mut self,
+        inputs: &[&[f32]],
+    ) -> Result<BatchTranscription, Box<dyn Error>> {
+        let wall = std::time::Instant::now();
+        let counts = inputs.iter().map(|x| x.len()).collect::<Vec<_>>();
+        for &count in &counts {
+            self.validate_sample_count(count)?;
+        }
+        if inputs.len() == 1 {
+            let result = self.transcribe(inputs[0])?;
+            return Ok(BatchTranscription {
+                cuda_stage_ms: result.inference_latency_ms,
+                results: vec![result],
+                execution: "single",
+                packed_encoder_rows: 0,
+                encoder_latency_ms: 0.0,
+                wall_latency_ms: wall.elapsed().as_secs_f64() * 1000.0,
+                model_and_workspace_bytes: self.uploaded.artifact.header.payload_bytes
+                    + self.workspace_device_bytes() as u64,
+            });
+        }
+        let layout = BatchLayout::new(&counts)?;
+        if self.batch_staging.is_none() {
+            self.batch_staging = Some(
+                self.uploaded
+                    .stream
+                    .alloc_zeros(MAX_BATCH_ROWS * encoder::MODEL_WIDTH)?,
+            );
+        }
+        self.uploaded
+            .stream
+            .memset_zeros(self.batch_staging.as_mut().unwrap())?;
+        let mut cuda_stage_ms = 0.0;
+        for (index, samples) in inputs.iter().enumerate() {
+            self.prepare_samples(samples)?;
+            let start = self
+                .uploaded
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            self.run_frontend_prepared(samples.len())?;
+            let end = self
+                .uploaded
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            cuda_stage_ms += f64::from(start.elapsed_ms(&end)?);
+            let offset = layout.offsets[index] * encoder::MODEL_WIDTH;
+            let elements = layout.valid_frames[index] * encoder::MODEL_WIDTH;
+            if elements != 0 {
+                self.uploaded.stream.memcpy_dtod(
+                    &self.workspace.encoder.state_a.slice(..elements),
+                    &mut self
+                        .batch_staging
+                        .as_mut()
+                        .unwrap()
+                        .slice_mut(offset..offset + elements),
+                )?;
+            }
+        }
+        let elements = layout.rows() * encoder::MODEL_WIDTH;
+        self.uploaded.stream.memcpy_dtod(
+            &self.batch_staging.as_ref().unwrap().slice(..elements),
+            &mut self.workspace.encoder.state_a.slice_mut(..elements),
+        )?;
+        self.workspace.encoder.bounds = Some(self.uploaded.stream.clone_htod(&layout.bounds)?);
+        let start = self
+            .uploaded
+            .stream
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let encoded = self.run_encoder(layout.rows(), layout.rows(), layout.rows());
+        // Never leave a batch mask installed when returning an inference error.
+        self.workspace.encoder.bounds = None;
+        encoded?;
+        let end = self
+            .uploaded
+            .stream
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let encoder_latency_ms = f64::from(start.elapsed_ms(&end)?);
+        cuda_stage_ms += encoder_latency_ms;
+        let mut results = Vec::with_capacity(inputs.len());
+        for (index, &sample_count) in counts.iter().enumerate() {
+            let frames = layout.valid_frames[index];
+            let padded = frames.next_multiple_of(16);
+            let offset = layout.offsets[index] * encoder::MODEL_WIDTH;
+            let elements = padded * encoder::MODEL_WIDTH;
+            if elements != 0 {
+                self.uploaded.stream.memcpy_dtod(
+                    &self
+                        .workspace
+                        .encoder
+                        .state_b
+                        .slice(offset..offset + elements),
+                    &mut self.workspace.encoder.state_a.slice_mut(..elements),
+                )?;
+            }
+            let start = self
+                .uploaded
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            self.run_decoder(frames, padded.max(16), true)?;
+            let end = self
+                .uploaded
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+            cuda_stage_ms += f64::from(start.elapsed_ms(&end)?);
+            results.push(self.read_transcription(sample_count, 0.0)?);
+        }
+        for result in &mut results {
+            result.inference_latency_ms = cuda_stage_ms;
+        }
+        Ok(BatchTranscription {
+            results,
+            execution: "packed_encoder_serial_frontend_decoder",
+            packed_encoder_rows: layout.rows(),
+            encoder_latency_ms,
+            cuda_stage_ms,
+            wall_latency_ms: wall.elapsed().as_secs_f64() * 1000.0,
+            model_and_workspace_bytes: self.uploaded.artifact.header.payload_bytes
+                + self.workspace_device_bytes() as u64,
+        })
+    }
+
+    fn validate_sample_count(&self, sample_count: usize) -> Result<(), Box<dyn Error>> {
+        if sample_count == 0 {
             return Err("audio must contain at least one sample".into());
         }
-        if samples.len() > self.max_samples {
+        if sample_count > self.max_samples {
             return Err(format!(
                 "audio has {} samples, exceeding the configured capacity of {}",
-                samples.len(),
-                self.max_samples
+                sample_count, self.max_samples
             )
             .into());
         }
+        Ok(())
+    }
+
+    fn prepare_samples(&mut self, samples: &[f32]) -> Result<(), Box<dyn Error>> {
+        self.validate_sample_count(samples.len())?;
         self.uploaded
             .stream
             .memcpy_htod(samples, &mut self.workspace.samples)?;
@@ -435,11 +670,19 @@ impl PipelineEngine {
     }
 
     fn run_prepared(&mut self, sample_count: usize) -> Result<(), Box<dyn Error>> {
+        self.run_frontend_prepared(sample_count)?;
+        let rows = subsampling::subsample_len(sample_count / self.config.hop_length + 1);
+        let valid = subsampling::subsample_len(sample_count / self.config.hop_length);
+        let padded = rows.next_multiple_of(16);
+        self.run_encoder(rows, valid, padded)?;
+        self.run_decoder(valid, padded, false)
+    }
+
+    fn run_frontend_prepared(&mut self, sample_count: usize) -> Result<(), Box<dyn Error>> {
         let mel_frames = sample_count / self.config.hop_length + 1;
         let valid_mel_frames = sample_count / self.config.hop_length;
         let encoder_frames = subsampling::subsample_len(mel_frames);
         let valid_encoder_frames = subsampling::subsample_len(valid_mel_frames);
-        let padded_encoder_frames = encoder_frames.next_multiple_of(16);
 
         let uploaded = &self.uploaded;
         let kernels = &self.kernels;
@@ -504,11 +747,6 @@ impl PipelineEngine {
             "encoder.subsampling.linear.bias",
             AotStorage::Sm89Fp32Bias,
         )?;
-        let encoder_weights = (0..ENCODER_LAYERS)
-            .map(|layer| encoder::LayerWeights::load(uploaded, layer))
-            .collect::<Result<Vec<_>, _>>()?;
-        let decoder_weights = decoder::DecoderWeights::load(uploaded)?;
-
         frontend::run_frontend(
             &uploaded.stream,
             &self.fft,
@@ -573,6 +811,21 @@ impl PipelineEngine {
                 None
             },
         )?;
+        Ok(())
+    }
+
+    fn run_encoder(
+        &mut self,
+        encoder_frames: usize,
+        valid_encoder_frames: usize,
+        padded_encoder_frames: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let uploaded = &self.uploaded;
+        let kernels = &self.kernels;
+        let workspace = &mut self.workspace;
+        let encoder_weights = (0..ENCODER_LAYERS)
+            .map(|layer| encoder::LayerWeights::load(uploaded, layer))
+            .collect::<Result<Vec<_>, _>>()?;
         encoder::run_layers(
             &uploaded.stream,
             &kernels.encoder,
@@ -583,7 +836,19 @@ impl PipelineEngine {
             encoder_frames,
             valid_encoder_frames,
             padded_encoder_frames,
-        )?;
+        )
+    }
+
+    fn run_decoder(
+        &mut self,
+        valid_encoder_frames: usize,
+        padded_encoder_frames: usize,
+        from_state_a: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let uploaded = &self.uploaded;
+        let kernels = &self.kernels;
+        let workspace = &mut self.workspace;
+        let decoder_weights = decoder::DecoderWeights::load(uploaded)?;
         decoder::launch_decode(
             &uploaded.stream,
             &kernels.linear,
@@ -594,7 +859,11 @@ impl PipelineEngine {
                 &kernels.decoder
             },
             &decoder_weights,
-            &workspace.encoder.state_b,
+            if from_state_a {
+                &workspace.encoder.state_a
+            } else {
+                &workspace.encoder.state_b
+            },
             &mut workspace.encoder_projection,
             &mut workspace.decoder_input_table,
             &mut workspace.decoder_workspace,
@@ -613,7 +882,7 @@ impl PipelineEngine {
             .stream
             .clone_dtoh(&self.workspace.output_count)?;
         let token_count = usize::try_from(count[0])?;
-        if token_count > self.workspace.output_tokens.len() {
+        if token_count > self.workspace.output_tokens.len() / 3 {
             return Err(format!(
                 "decoder produced {token_count} tokens into capacity {}",
                 self.workspace.output_tokens.len()
@@ -628,7 +897,16 @@ impl PipelineEngine {
 
     fn workspace_device_bytes(&self) -> usize {
         let workspace = &self.workspace;
-        workspace.samples.len() * size_of::<f32>()
+        self.batch_staging
+            .as_ref()
+            .map_or(0, |x| x.len() * size_of::<f16>())
+            + workspace
+                .encoder
+                .bounds
+                .as_ref()
+                .map_or(0, |x| x.len() * size_of::<i32>())
+            + workspace.pcm16.len() * size_of::<u8>()
+            + workspace.samples.len() * size_of::<f32>()
             + self.window.len() * size_of::<f32>()
             + self.filter_offsets.len() * size_of::<i32>()
             + self.filter_bins.len() * size_of::<i32>()
@@ -727,7 +1005,8 @@ pub fn benchmark_pipeline(
         trial_latency_ms.push(f64::from(started.elapsed_ms(&ended)?));
     }
 
-    let token_ids = engine.read_tokens()?;
+    let transcription = engine.read_transcription(samples.len(), 0.0)?;
+    let token_ids = transcription.token_ids;
     let exact_token_match = reference_tokens.map(|expected| expected == token_ids);
     if exact_token_match == Some(false) {
         let expected = reference_tokens.expect("reference exists");
@@ -788,6 +1067,8 @@ pub fn benchmark_pipeline(
         realtime_factor: audio_seconds / (median_latency_ms / 1000.0),
         token_count: token_ids.len(),
         token_ids,
+        tokens: transcription.tokens,
+        words: transcription.words,
         transcript,
         reference_token_count: reference_tokens.map_or(0, <[i32]>::len),
         exact_token_match,
